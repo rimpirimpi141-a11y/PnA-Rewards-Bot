@@ -21,8 +21,8 @@ workers_dev = true
 
 [[kv_namespaces]]
 binding = "DB"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
-preview_id = "REPLACE_WITH_YOUR_PREVIEW_KV_NAMESPACE_ID"
+id = "ef7469b6be4048849dc075ee23c10c5a"
+preview_id = "ef7469b6be4048849dc075ee23c10c5a"
 
 [vars]
 OWNER_ID = "8838351233"
