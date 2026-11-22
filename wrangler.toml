@@ -1,0 +1,34 @@
+# ============================================================================
+# 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Cloudflare Workers Configuration
+# ============================================================================
+# 1. Create KV namespace:
+#      npx wrangler kv namespace create DB
+#    Copy the returned `id` below (and optionally create a preview namespace
+#    with `npx wrangler kv namespace create DB --preview`).
+#
+# 2. Set Worker secrets (NEVER put secrets in this file):
+#      npx wrangler secret put BOT_TOKEN
+#      npx wrangler secret put WEBHOOK_SECRET
+#
+# 3. Deploy:
+#      npx wrangler deploy
+# ============================================================================
+
+name = "pna-rewards-bot"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "DB"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+preview_id = "REPLACE_WITH_YOUR_PREVIEW_KV_NAMESPACE_ID"
+
+[vars]
+OWNER_ID = "8838351233"
+SUPPORT_USERNAME = "@Pritam_power"
+UPDATE_CHANNEL_URL = "https://t.me/pnarewards"
+TIMEZONE = "Asia/Kolkata"
+WEBHOOK_PATH = "/webhook"
+# Optional: set BOT_USERNAME (without @) to avoid an extra getMe lookup on cold start
+BOT_USERNAME = ""

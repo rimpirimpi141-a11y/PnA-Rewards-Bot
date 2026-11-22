@@ -1,0 +1,6 @@
+{
+  "name": "P^A REWARDS Telegram Bot",
+  "description": "Production-ready Telegram rewards and voucher bot running on Cloudflare Workers with Cloudflare KV storage.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
