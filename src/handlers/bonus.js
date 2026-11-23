@@ -184,10 +184,7 @@ export async function handleDailyBonusHistoryCallback(env, callbackQuery) {
 
   await editOrSend(env, chatId, msgId, text, {
     reply_markup: {
-      inline_keyboard: [
-        [{ text: '⬅️ Back to Daily Bonus', callback_data: 'usr:bonus' }],
-        [{ text: '🏠 Back to Main Menu', callback_data: 'usr:home' }],
-      ],
+      inline_keyboard: [[{ text: '⬅️ Back to Daily Bonus', callback_data: 'usr:bonus' }]],
     },
   });
 }

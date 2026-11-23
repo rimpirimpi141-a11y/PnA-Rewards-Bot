@@ -74,10 +74,7 @@ export async function handleReferralListView(env, tgUser, chatId, messageId = nu
 
   await editOrSend(env, chatId, messageId, text, {
     reply_markup: {
-      inline_keyboard: [
-        [{ text: '⬅️ Back to Refer & Earn', callback_data: 'usr:refer' }],
-        [{ text: '🏠 Back to Main Menu', callback_data: 'usr:home' }],
-      ],
+      inline_keyboard: [[{ text: '⬅️ Back to Refer & Earn', callback_data: 'usr:refer' }]],
     },
   });
 }

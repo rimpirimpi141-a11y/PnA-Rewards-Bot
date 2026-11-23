@@ -1,25 +1,50 @@
 // ============================================================================
-// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Telegram Keyboards (Reply & Inline Layouts)
+// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Real Colourful Telegram Reply Keyboards & Secondary Actions
+// ============================================================================
+// Uses Telegram Bot API KeyboardButton `style` field on ReplyKeyboardMarkup:
+//   "success" = GREEN
+//   "primary" = BLUE
+//   "danger"  = RED
+// Main user and admin navigation stays persistently at the bottom of chat.
+// Inline buttons are used ONLY for external URLs or item/request-specific actions.
 // ============================================================================
 
-import { MENU_BUTTONS, VOUCHER_CATEGORY_LIST } from './config.js';
+import {
+  ADMIN_BUTTONS,
+  BUTTON_STYLES,
+  MENU_BUTTONS,
+  VOUCHER_CATEGORY_LIST,
+} from './config.js';
+
+const { SUCCESS, PRIMARY, DANGER } = BUTTON_STYLES;
 
 /**
- * Main User Menu ReplyKeyboard:
- * - Three visually prominent primary buttons on top rows
- * - Cleanly organized secondary actions
- * - Optional Admin Panel button for authorized admins
+ * Colourful Persistent User Main Menu ReplyKeyboard:
+ * Row 1: 💰 My Balance (GREEN) | 👥 Refer & Earn (BLUE)
+ * Row 2: 💸 Withdraw (RED)     | 🎁 Daily Bonus (GREEN)
+ * Row 3: 👤 My Profile (BLUE)  | 📢 Update Channel (GREEN)
+ * Row 4: 🎧 Support (BLUE)
+ * Row 5 (Admins only): 👑 Admin Panel (BLUE)
  */
 export function mainMenuKeyboard(isAdminUser = false) {
   const rows = [
-    [{ text: MENU_BUTTONS.BALANCE }, { text: MENU_BUTTONS.REFER }],
-    [{ text: MENU_BUTTONS.WITHDRAW }],
-    [{ text: MENU_BUTTONS.DAILY_BONUS }, { text: MENU_BUTTONS.PROFILE }],
-    [{ text: MENU_BUTTONS.UPDATE_CHANNEL }, { text: MENU_BUTTONS.SUPPORT }],
+    [
+      { text: MENU_BUTTONS.BALANCE, style: SUCCESS },
+      { text: MENU_BUTTONS.REFER, style: PRIMARY },
+    ],
+    [
+      { text: MENU_BUTTONS.WITHDRAW, style: DANGER },
+      { text: MENU_BUTTONS.DAILY_BONUS, style: SUCCESS },
+    ],
+    [
+      { text: MENU_BUTTONS.PROFILE, style: PRIMARY },
+      { text: MENU_BUTTONS.UPDATE_CHANNEL, style: SUCCESS },
+    ],
+    [{ text: MENU_BUTTONS.SUPPORT, style: PRIMARY }],
   ];
 
   if (isAdminUser) {
-    rows.push([{ text: MENU_BUTTONS.ADMIN_PANEL }]);
+    rows.push([{ text: MENU_BUTTONS.ADMIN_PANEL, style: PRIMARY }]);
   }
 
   return {
@@ -31,48 +56,106 @@ export function mainMenuKeyboard(isAdminUser = false) {
 }
 
 /**
- * Cancel / Return keyboard for interactive text-input states.
+ * Colourful Persistent Admin Panel ReplyKeyboard (Bottom Navigation — No Inline Dashboard):
+ * Row 1: ➕ Add Voucher (GREEN)    | 📋 Pending Requests (BLUE)
+ * Row 2: 📢 Force Channels (GREEN) | ⚙️ Settings (BLUE)
+ * Row 3: 👥 Users List (BLUE)      | 👑 Add Admin (GREEN)
+ * Row 4: 📊 Statistics (BLUE)      | 📣 Broadcast (GREEN)
+ * Row 5: 📦 Voucher Stock (GREEN)  | 📝 Voucher History (BLUE)
+ * Row 6: 🚨 Low Stock (RED)        | 🔧 Maintenance (RED)
+ * Row 7: 📜 Activity Logs (BLUE)   | 🏠 Main Menu (BLUE)
  */
-export function cancelInputKeyboard() {
+export function adminReplyKeyboard() {
   return {
-    keyboard: [[{ text: MENU_BUTTONS.CANCEL }, { text: MENU_BUTTONS.MAIN_MENU }]],
+    keyboard: [
+      [
+        { text: ADMIN_BUTTONS.ADD_VOUCHER, style: SUCCESS },
+        { text: ADMIN_BUTTONS.PENDING_REQUESTS, style: PRIMARY },
+      ],
+      [
+        { text: ADMIN_BUTTONS.FORCE_CHANNELS, style: SUCCESS },
+        { text: ADMIN_BUTTONS.SETTINGS, style: PRIMARY },
+      ],
+      [
+        { text: ADMIN_BUTTONS.USERS_LIST, style: PRIMARY },
+        { text: ADMIN_BUTTONS.ADD_ADMIN, style: SUCCESS },
+      ],
+      [
+        { text: ADMIN_BUTTONS.STATISTICS, style: PRIMARY },
+        { text: ADMIN_BUTTONS.BROADCAST, style: SUCCESS },
+      ],
+      [
+        { text: ADMIN_BUTTONS.VOUCHER_STOCK, style: SUCCESS },
+        { text: ADMIN_BUTTONS.VOUCHER_HISTORY, style: PRIMARY },
+      ],
+      [
+        { text: ADMIN_BUTTONS.LOW_STOCK, style: DANGER },
+        { text: ADMIN_BUTTONS.MAINTENANCE, style: DANGER },
+      ],
+      [
+        { text: ADMIN_BUTTONS.ACTIVITY_LOGS, style: PRIMARY },
+        { text: MENU_BUTTONS.MAIN_MENU, style: PRIMARY },
+      ],
+    ],
     resize_keyboard: true,
+    is_persistent: true,
     one_time_keyboard: false,
   };
 }
 
 /**
- * Force-join channel buttons + verification CTA.
+ * Colourful Cancel / Escape ReplyKeyboard for multi-step text/media inputs.
+ */
+export function cancelInputKeyboard(isAdminContext = false) {
+  return {
+    keyboard: [
+      [
+        { text: MENU_BUTTONS.CANCEL, style: DANGER },
+        {
+          text: isAdminContext ? MENU_BUTTONS.ADMIN_PANEL : MENU_BUTTONS.MAIN_MENU,
+          style: PRIMARY,
+        },
+      ],
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+    one_time_keyboard: false,
+  };
+}
+
+// ============================================================================
+// SECONDARY INLINE KEYBOARDS (External URLs & Item/Request-Specific Actions Only)
+// ============================================================================
+
+/**
+ * Force-join channel URL buttons + ✅ VERIFY MEMBERSHIP action.
  */
 export function forceJoinKeyboard(channels) {
   const inline_keyboard = [];
+  const multiple = channels.length > 1;
+
   for (let i = 0; i < channels.length; i++) {
     const ch = channels[i];
     if (ch.inviteLink) {
+      const label = multiple
+        ? `🔗 JOIN CHANNEL (${ch.title || `#${i + 1}`})`
+        : '🔗 JOIN CHANNEL';
       inline_keyboard.push([
         {
-          text: `📢 Join ${ch.title || `Channel ${i + 1}`}`,
+          text: label.slice(0, 60),
           url: ch.inviteLink,
         },
       ]);
     }
   }
-  inline_keyboard.push([{ text: '✅ JOINED - VERIFY', callback_data: 'fj:verify' }]);
+
+  inline_keyboard.push([{ text: '✅ VERIFY MEMBERSHIP', callback_data: 'fj:verify' }]);
   return { inline_keyboard };
 }
 
 export function balanceInlineKeyboard() {
   return {
-    inline_keyboard: [
-      [
-        { text: '💸 Withdraw Now', callback_data: 'usr:withdraw' },
-        { text: '👥 Refer & Earn', callback_data: 'usr:refer' },
-      ],
-      [
-        { text: '🎁 Daily Bonus', callback_data: 'usr:bonus' },
-        { text: '🎟️ My Vouchers', callback_data: 'usr:history' },
-      ],
-    ],
+    inline_keyboard: [[{ text: '🎟️ My Vouchers & Withdrawals', callback_data: 'usr:history' }]],
   };
 }
 
@@ -85,7 +168,6 @@ export function referralInlineKeyboard(referralLink, rewardText) {
     inline_keyboard: [
       [{ text: '📤 Share Referral Link', url: shareUrl }],
       [{ text: '📋 My Referral List', callback_data: 'usr:ref_list' }],
-      [{ text: '🏠 Back to Main Menu', callback_data: 'usr:home' }],
     ],
   };
 }
@@ -98,20 +180,12 @@ export function dailyBonusInlineKeyboard(canClaim) {
     rows.push([{ text: '🔄 Refresh Countdown', callback_data: 'bonus:refresh' }]);
   }
   rows.push([{ text: '📜 My Bonus History', callback_data: 'bonus:history' }]);
-  rows.push([{ text: '🏠 Back to Main Menu', callback_data: 'usr:home' }]);
   return { inline_keyboard: rows };
 }
 
 export function profileInlineKeyboard() {
   return {
-    inline_keyboard: [
-      [{ text: '🎟️ My Vouchers & Withdrawals', callback_data: 'usr:history' }],
-      [
-        { text: '💰 My Balance', callback_data: 'usr:balance' },
-        { text: '👥 Refer & Earn', callback_data: 'usr:refer' },
-      ],
-      [{ text: '🏠 Back to Main Menu', callback_data: 'usr:home' }],
-    ],
+    inline_keyboard: [[{ text: '🎟️ My Vouchers & Withdrawals', callback_data: 'usr:history' }]],
   };
 }
 
@@ -128,7 +202,6 @@ export function withdrawCategoriesKeyboard(stockSummary) {
     ]);
   }
   rows.push([{ text: '📜 My Withdrawal History', callback_data: 'usr:history' }]);
-  rows.push([{ text: '🏠 Back to Main Menu', callback_data: 'usr:home' }]);
   return { inline_keyboard: rows };
 }
 
@@ -137,7 +210,6 @@ export function withdrawConfirmKeyboard(categoryKey) {
     inline_keyboard: [
       [{ text: '✅ Confirm Withdrawal Request', callback_data: `wd:confirm:${categoryKey}` }],
       [{ text: '⬅️ Change Category', callback_data: 'usr:withdraw' }],
-      [{ text: '❌ Cancel', callback_data: 'usr:home' }],
     ],
   };
 }
@@ -145,68 +217,22 @@ export function withdrawConfirmKeyboard(categoryKey) {
 export function supportInlineKeyboard(supportUsername) {
   const clean = String(supportUsername || '@Pritam_power').replace(/^@/, '');
   return {
-    inline_keyboard: [
-      [{ text: `💬 Message @${clean}`, url: `https://t.me/${clean}` }],
-      [{ text: '🏠 Back to Main Menu', callback_data: 'usr:home' }],
-    ],
+    inline_keyboard: [[{ text: `💬 Message @${clean}`, url: `https://t.me/${clean}` }]],
   };
 }
 
 export function updateChannelInlineKeyboard(channelUrl) {
   return {
-    inline_keyboard: [
-      [{ text: '📢 Join Update Channel', url: channelUrl }],
-      [{ text: '🏠 Back to Main Menu', callback_data: 'usr:home' }],
-    ],
+    inline_keyboard: [[{ text: '📢 Join Update Channel', url: channelUrl }]],
   };
 }
 
-// ============================================================================
-// ADMIN PANEL KEYBOARDS (All 13 Requested Sections)
-// ============================================================================
-
-export function adminMainKeyboard(isOwnerUser = false) {
-  const rows = [
-    [
-      { text: '➕ Add Voucher', callback_data: 'adm:add_voucher' },
-      { text: '📋 Pending Requests', callback_data: 'adm:pending:1' },
-    ],
-    [
-      { text: '📢 Force Channels', callback_data: 'adm:force_channels' },
-      { text: '⚙️ Settings', callback_data: 'adm:settings' },
-    ],
-    [
-      { text: '👥 Users List', callback_data: 'adm:users:1' },
-      {
-        text: isOwnerUser ? '👑 Manage Admins' : '👑 View Admins',
-        callback_data: 'adm:admins',
-      },
-    ],
-    [
-      { text: '📊 Bot Statistics', callback_data: 'adm:stats' },
-      { text: '📣 Broadcast', callback_data: 'adm:broadcast' },
-    ],
-    [
-      { text: '📦 Voucher Stock', callback_data: 'adm:stock' },
-      { text: '📝 Voucher History', callback_data: 'adm:vhist:1' },
-    ],
-    [
-      { text: '🚨 Low Stock Settings', callback_data: 'adm:low_stock' },
-      { text: '🔧 Maintenance Mode', callback_data: 'adm:maintenance' },
-    ],
-    [{ text: '📜 Admin Activity Logs', callback_data: 'adm:logs:1' }],
-    [{ text: '🏠 Exit to Main Menu', callback_data: 'adm:exit' }],
-  ];
-  return { inline_keyboard: rows };
-}
-
-export function adminBackKeyboard(extraRows = []) {
-  return {
-    inline_keyboard: [
-      ...extraRows,
-      [{ text: '⬅️ Back to Admin Panel', callback_data: 'adm:menu' }],
-    ],
-  };
+/**
+ * Optional secondary action keyboard for admin item views (never renders full admin menu inline).
+ */
+export function adminActionKeyboard(extraRows = []) {
+  if (!extraRows || !extraRows.length) return undefined;
+  return { inline_keyboard: extraRows };
 }
 
 export function withdrawalAdminDecisionKeyboard(requestId) {
@@ -228,7 +254,6 @@ export function voucherCategorySelectKeyboard(prefix) {
       callback_data: `${prefix}:${cat.key}`,
     },
   ]);
-  rows.push([{ text: '⬅️ Back to Admin Panel', callback_data: 'adm:menu' }]);
   return { inline_keyboard: rows };
 }
 

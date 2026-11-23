@@ -1,5 +1,5 @@
 // ============================================================================
-// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Admin Force-Join Channel Management Handler
+// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Admin Force-Join & Request-to-Join Channel Management
 // ============================================================================
 
 import { DIVIDER, buildHeader } from '../animations.js';
@@ -17,12 +17,12 @@ import {
   setUserState,
 } from '../database.js';
 import {
-  adminBackKeyboard,
+  adminActionKeyboard,
+  adminReplyKeyboard,
   cancelInputKeyboard,
-  mainMenuKeyboard,
 } from '../keyboards.js';
 import { logAdminActivity } from '../services/activity-log.js';
-import { inspectChannelForAdmin } from '../services/membership.js';
+import { inspectChannelForAdmin, resolveChannelTarget } from '../services/membership.js';
 import { answerCallbackQuery, editOrSend, sendMessage } from '../telegram.js';
 
 /**
@@ -38,6 +38,7 @@ export async function handleAdminForceChannelsMenu(env, adminId, chatId, message
   let text =
     `${buildHeader('📢', 'FORCE-JOIN CHANNELS')}\n` +
     `Configured Channels: <b>${channels.length}</b>\n` +
+    `⚠️ <i>Important: This bot MUST be an <b>Administrator</b> in every configured channel (with "Invite Users via Link" enabled for Request-to-Join links).</i>\n` +
     `${DIVIDER}\n`;
 
   const rows = [
@@ -49,27 +50,29 @@ export async function handleAdminForceChannelsMenu(env, adminId, chatId, message
   } else {
     for (let i = 0; i < channels.length; i++) {
       const ch = channels[i];
+      const modeBadge = ch.isRequestToJoin ? '🔐 Request-to-Join' : '🌐 Normal Join';
+      const userLine = ch.username ? `\n   🏷️ Username: <code>${escapeHtml(ch.username)}</code>` : '';
       text +=
-        `${i + 1}. <b>${escapeHtml(ch.title)}</b>\n` +
-        `   🆔 Chat ID: <code>${escapeHtml(ch.chatId)}</code>\n` +
-        `   🔗 Link: ${escapeHtml(ch.inviteLink)}\n\n`;
+        `${i + 1}. <b>${escapeHtml(ch.title)}</b> (${modeBadge})\n` +
+        `   🆔 Chat ID: <code>${escapeHtml(ch.chatId)}</code>${userLine}\n` +
+        `   🔗 Invite URL: ${escapeHtml(ch.inviteLink)}\n\n`;
       rows.push([
         {
-          text: `🗑️ Remove: ${ch.title.slice(0, 26)}`,
+          text: `🗑️ Remove: ${String(ch.title || ch.chatId).slice(0, 26)}`,
           callback_data: `adm:fj_del:${ch.id}`,
         },
       ]);
     }
-    rows.push([{ text: '🩺 Test Channel Permissions', callback_data: 'adm:fj_test' }]);
+    rows.push([{ text: '🩺 Test Channels & Bot Admin Status', callback_data: 'adm:fj_test' }]);
   }
 
   await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminBackKeyboard(rows),
+    reply_markup: adminActionKeyboard(rows),
   });
 }
 
 /**
- * Start Add Force Channel wizard
+ * Step 1: Start Add Force Channel wizard (separate Channel ID / Username from Invite URL)
  */
 export async function handleAdminForceChannelAddStart(env, callbackQuery) {
   const adminId = callbackQuery.from.id;
@@ -85,16 +88,17 @@ export async function handleAdminForceChannelAddStart(env, callbackQuery) {
   await sendMessage(
     env,
     chatId,
-    `${buildHeader('➕', 'ADD FORCE-JOIN CHANNEL (STEP 1/2)')}\n` +
-      `Send the channel's <b>@username</b> (public) OR numeric <b>Chat ID</b> (private, e.g. <code>-1001234567890</code>).\n\n` +
-      `⚠️ <i>Make sure this bot is already added as an <b>Admin</b> in that channel so membership checks succeed.</i>\n\n` +
+    `${buildHeader('➕', 'ADD FORCE-JOIN CHANNEL (STEP 1/3)')}\n` +
+      `Send the channel's <b>numeric Channel ID</b> (recommended for private & request-to-join channels, e.g. <code>-1001234567890</code>) OR public <b>@username</b> (e.g. <code>@pnarewards</code>).\n\n` +
+      `⚠️ <b>Do NOT send an invite URL here</b> — you will enter the invite URL separately in Step 3.\n` +
+      `🛡️ <b>Requirement:</b> Add this bot as an <b>Administrator</b> in the channel first.\n\n` +
       `Tap <b>❌ Cancel</b> to abort.`,
-    { reply_markup: cancelInputKeyboard() }
+    { reply_markup: cancelInputKeyboard(true) }
   );
 }
 
 /**
- * Step 1 input: Chat ID or @username
+ * Step 1 input: Channel ID or @username -> inspect connectivity & Bot Admin status
  */
 export async function handleAdminForceChannelChatIdInput(env, message) {
   const adminId = message.from.id;
@@ -106,64 +110,148 @@ export async function handleAdminForceChannelChatIdInput(env, message) {
 
   const raw = String(message.text || '').trim();
   if (!raw) {
-    await sendMessage(env, chatId, '⚠️ Please send a valid @channelusername or numeric -100... chat ID.');
+    await sendMessage(env, chatId, '⚠️ Please send a valid numeric Channel ID (<code>-100...</code>) or public <code>@username</code>.');
     return;
   }
 
-  // Validate format: @username or negative numeric ID
+  if (raw.startsWith('http://') || raw.startsWith('https://') || raw.includes('t.me/')) {
+    await sendMessage(
+      env,
+      chatId,
+      '⚠️ That looks like an invite URL, not a Channel ID.\n\nPlease send the numeric Channel ID (e.g. <code>-1001234567890</code>) or public <code>@username</code> first. You will provide the invite URL in Step 3.'
+    );
+    return;
+  }
+
   const isUsername = /^@[a-zA-Z0-9_]{4,32}$/.test(raw);
   const isNumericId = /^-100\d{5,20}$/.test(raw) || /^-\d{5,20}$/.test(raw);
   if (!isUsername && !isNumericId) {
     await sendMessage(
       env,
       chatId,
-      '⚠️ Invalid format. Send either a public <code>@channelusername</code> or a channel ID starting with <code>-100</code>.'
+      '⚠️ Invalid format. Send either a numeric channel ID starting with <code>-100</code> or a public <code>@channelusername</code>.'
     );
     return;
   }
 
   const inspection = await inspectChannelForAdmin(env, raw);
   let resolvedChatId = raw;
+  let resolvedUsername = isUsername ? raw : '';
   let resolvedTitle = raw;
+  let isPrivate = !isUsername;
   let suggestedLink = isUsername ? `https://t.me/${raw.slice(1)}` : '';
-  let warningText = '';
+  let diagnosticBlock = '';
 
   if (inspection.ok) {
     resolvedChatId = inspection.chat.chatId;
+    resolvedUsername = inspection.chat.username || resolvedUsername;
     resolvedTitle = inspection.chat.title;
+    isPrivate = inspection.chat.isPrivate;
     if (inspection.chat.inviteLink) {
       suggestedLink = inspection.chat.inviteLink;
     }
+
+    if (inspection.isBotAdmin) {
+      const invitePerm = inspection.canInviteUsers
+        ? '✅ Invite/Join-Request Access: Enabled'
+        : '⚠️ Invite/Join-Request Access: OFF (enable "Invite Users via Link" for Request-to-Join channels)';
+      diagnosticBlock =
+        `✅ <b>Connectivity:</b> Connected\n` +
+        `🛡️ <b>Bot Admin Status:</b> Confirmed (<code>${escapeHtml(inspection.botStatus)}</code>)\n` +
+        `${invitePerm}`;
+    } else {
+      diagnosticBlock =
+        `✅ <b>Connectivity:</b> Reachable\n` +
+        `❌ <b>Bot Admin Status:</b> NOT Administrator (<code>${escapeHtml(inspection.botStatus)}</code>)\n` +
+        `🛠️ <b>Fix Required:</b> ${escapeHtml(inspection.fixHint)}`;
+    }
   } else {
-    warningText =
-      `\n\n⚠️ <b>Heads-up:</b> Telegram returned: <i>${escapeHtml(inspection.error)}</i>\n` +
-      `Please double-check that the bot is an Admin in that channel before expecting users to verify.`;
+    diagnosticBlock =
+      `❌ <b>Connectivity Error:</b> <i>${escapeHtml(inspection.error)}</i>\n` +
+      `🛠️ <b>Fix Required:</b> ${escapeHtml(inspection.fixHint)}`;
   }
 
   await setUserState(env, adminId, {
-    type: 'admin_fj_invite_link',
+    type: 'admin_fj_mode_select',
     chatId: resolvedChatId,
+    username: resolvedUsername,
     title: resolvedTitle,
+    isPrivate,
     suggestedLink,
   });
 
-  const hint = suggestedLink
-    ? `Detected invite link: <code>${escapeHtml(suggestedLink)}</code>\nSend a custom invite link, or type <code>use</code> to use the detected link.`
+  const userRow = resolvedUsername ? `\n🏷️ <b>Username:</b> <code>${escapeHtml(resolvedUsername)}</code>` : '';
+
+  await sendMessage(
+    env,
+    chatId,
+    `${buildHeader('🔐', 'ADD FORCE-JOIN CHANNEL (STEP 2/3)')}\n` +
+      `📢 <b>Channel:</b> ${escapeHtml(resolvedTitle)}\n` +
+      `🆔 <b>Resolved Channel ID:</b> <code>${escapeHtml(resolvedChatId)}</code>${userRow}\n` +
+      `${DIVIDER}\n` +
+      `${diagnosticBlock}\n` +
+      `${DIVIDER}\n` +
+      `Select the invite link type for this channel:`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🌐 Normal Invite Link (Instant Join)', callback_data: 'adm:fj_mode:normal' }],
+          [{ text: '🔐 Request-to-Join Invite Link (Admin Approval)', callback_data: 'adm:fj_mode:request' }],
+        ],
+      },
+    }
+  );
+}
+
+/**
+ * Step 2 callback: Choose Normal vs Request-to-Join invite link mode
+ */
+export async function handleAdminForceChannelModeSelect(env, callbackQuery, mode, state) {
+  const adminId = callbackQuery.from.id;
+  const chatId = callbackQuery.message?.chat?.id || adminId;
+  if (!(await hasAdminPermission(adminId, 'manageForceChannels', env))) {
+    await answerCallbackQuery(env, callbackQuery.id, '🚫 Permission denied.', true);
+    return;
+  }
+
+  if (!state || state.type !== 'admin_fj_mode_select') {
+    await answerCallbackQuery(env, callbackQuery.id, 'Session expired. Start adding the channel again.', true);
+    return;
+  }
+
+  const isRequestToJoin = mode === 'request';
+  await setUserState(env, adminId, {
+    ...state,
+    type: 'admin_fj_invite_link',
+    isRequestToJoin,
+  });
+
+  await answerCallbackQuery(
+    env,
+    callbackQuery.id,
+    isRequestToJoin ? 'Selected Request-to-Join' : 'Selected Normal Invite Link'
+  );
+
+  const hint = isRequestToJoin
+    ? `Send your <b>Request-to-Join Invite URL</b> (e.g. <code>https://t.me/+AbCdEfGhIjK</code>).\n\n<i>Note: Users who request access will see a pending-approval status and will NOT be granted bot access until a channel admin approves them.</i>`
+    : state.suggestedLink
+    ? `Detected invite link: <code>${escapeHtml(state.suggestedLink)}</code>\nSend a custom invite link, or type <code>use</code> to use the detected link.`
     : `Send the channel's <b>Telegram Invite Link</b> (e.g. <code>https://t.me/+AbCdEfGhIjK</code> or <code>https://t.me/pnarewards</code>).`;
 
   await sendMessage(
     env,
     chatId,
-    `${buildHeader('🔗', 'ADD FORCE-JOIN CHANNEL (STEP 2/2)')}\n` +
-      `📢 <b>Channel:</b> ${escapeHtml(resolvedTitle)}\n` +
-      `🆔 <b>Chat ID:</b> <code>${escapeHtml(resolvedChatId)}</code>\n\n` +
-      `${hint}${warningText}`,
-    { reply_markup: cancelInputKeyboard() }
+    `${buildHeader('🔗', 'ADD FORCE-JOIN CHANNEL (STEP 3/3)')}\n` +
+      `📢 <b>Channel:</b> ${escapeHtml(state.title)}\n` +
+      `🆔 <b>Channel ID:</b> <code>${escapeHtml(state.chatId)}</code>\n` +
+      `🔐 <b>Join Mode:</b> ${isRequestToJoin ? 'Request-to-Join (Approval Required)' : 'Normal Join'}\n\n` +
+      `${hint}`,
+    { reply_markup: cancelInputKeyboard(true) }
   );
 }
 
 /**
- * Step 2 input: Invite link
+ * Step 3 input: Invite URL (stored strictly separate from Channel ID)
  */
 export async function handleAdminForceChannelLinkInput(env, message, state) {
   const adminId = message.from.id;
@@ -174,7 +262,7 @@ export async function handleAdminForceChannelLinkInput(env, message, state) {
   }
 
   let input = String(message.text || '').trim();
-  if (input.toLowerCase() === 'use' && state.suggestedLink) {
+  if (input.toLowerCase() === 'use' && state.suggestedLink && !state.isRequestToJoin) {
     input = state.suggestedLink;
   }
 
@@ -182,7 +270,7 @@ export async function handleAdminForceChannelLinkInput(env, message, state) {
     await sendMessage(
       env,
       chatId,
-      '⚠️ Please send a valid Telegram channel link starting with <code>https://t.me/</code>.'
+      '⚠️ Please send a valid Telegram invite URL starting with <code>https://t.me/</code>.'
     );
     return;
   }
@@ -193,8 +281,11 @@ export async function handleAdminForceChannelLinkInput(env, message, state) {
   const newChannel = {
     id: existingIdx >= 0 ? channels[existingIdx].id : generateId('FJ'),
     chatId: String(state.chatId),
+    username: String(state.username || ''),
     title: String(state.title || state.chatId),
     inviteLink: input,
+    isPrivate: Boolean(state.isPrivate),
+    isRequestToJoin: Boolean(state.isRequestToJoin),
     addedBy: String(adminId),
     addedAt: Date.now(),
   };
@@ -212,14 +303,24 @@ export async function handleAdminForceChannelLinkInput(env, message, state) {
     env,
     adminId,
     ACTIVITY_ACTIONS.FORCE_CHANNEL_ADDED,
-    `Added/Updated force-join channel "${newChannel.title}" (${newChannel.chatId}) -> ${newChannel.inviteLink}`
+    `Saved force-join channel "${newChannel.title}" (${newChannel.chatId}, ${newChannel.isRequestToJoin ? 'Request-to-Join' : 'Normal'}) -> ${newChannel.inviteLink}`
   );
+
+  const modeLabel = newChannel.isRequestToJoin
+    ? '🔐 Request-to-Join (Admin Approval Required)'
+    : '🌐 Normal Invite Link';
 
   await sendMessage(
     env,
     chatId,
-    `✅ <b>Force-Join Channel Saved!</b>\n${DIVIDER}\n📢 <b>Title:</b> ${escapeHtml(newChannel.title)}\n🆔 <b>Chat ID:</b> <code>${escapeHtml(newChannel.chatId)}</code>\n🔗 <b>Link:</b> ${escapeHtml(newChannel.inviteLink)}`,
-    { reply_markup: mainMenuKeyboard(true) }
+    `✅ <b>Force-Join Channel Saved!</b>\n` +
+      `${DIVIDER}\n` +
+      `📢 <b>Title:</b> ${escapeHtml(newChannel.title)}\n` +
+      `🆔 <b>Channel ID:</b> <code>${escapeHtml(newChannel.chatId)}</code>\n` +
+      `${newChannel.username ? `🏷️ <b>Username:</b> <code>${escapeHtml(newChannel.username)}</code>\n` : ''}` +
+      `🔐 <b>Join Mode:</b> ${modeLabel}\n` +
+      `🔗 <b>Invite URL:</b> ${escapeHtml(newChannel.inviteLink)}`,
+    { reply_markup: adminReplyKeyboard() }
   );
   await handleAdminForceChannelsMenu(env, adminId, chatId);
 }
@@ -260,7 +361,7 @@ export async function handleAdminForceChannelDelete(env, callbackQuery, channelI
 }
 
 /**
- * Diagnose bot access/permissions across all configured force-join channels
+ * Full Connectivity & Bot Administrator Permission Diagnostic for all Force-Join Channels
  */
 export async function handleAdminForceChannelTest(env, callbackQuery) {
   const adminId = callbackQuery.from.id;
@@ -272,19 +373,41 @@ export async function handleAdminForceChannelTest(env, callbackQuery) {
     return;
   }
 
-  await answerCallbackQuery(env, callbackQuery.id, '🩺 Testing channel access...');
+  await answerCallbackQuery(env, callbackQuery.id, '🩺 Running channel & bot admin diagnostics...');
   const channels = await getForceChannels(env);
 
-  let text = `${buildHeader('🩺', 'FORCE-JOIN CHANNEL HEALTH CHECK')}\n`;
+  let text = `${buildHeader('🩺', 'FORCE-JOIN DIAGNOSTICS')}\n`;
   if (!channels.length) {
-    text += `<i>No channels configured.</i>`;
+    text += `<i>No force-join channels configured.</i>`;
   } else {
-    for (const ch of channels) {
-      const check = await inspectChannelForAdmin(env, ch.chatId);
-      if (check.ok) {
-        text += `✅ <b>${escapeHtml(check.chat.title)}</b> (<code>${escapeHtml(ch.chatId)}</code>) — Accessible\n`;
+    for (let i = 0; i < channels.length; i++) {
+      const ch = channels[i];
+      const target = resolveChannelTarget(ch);
+      const check = await inspectChannelForAdmin(env, target);
+      const modeTag = ch.isRequestToJoin ? 'Request-to-Join' : 'Normal';
+
+      if (!check.ok) {
+        text +=
+          `${i + 1}. ❌ <b>${escapeHtml(ch.title)}</b> (${modeTag})\n` +
+          `   🆔 <code>${escapeHtml(ch.chatId)}</code>\n` +
+          `   ❌ Connectivity: <i>${escapeHtml(check.error)}</i>\n` +
+          `   🛠️ Fix: ${escapeHtml(check.fixHint)}\n\n`;
+      } else if (!check.isBotAdmin) {
+        text +=
+          `${i + 1}. ⚠️ <b>${escapeHtml(check.chat.title)}</b> (${modeTag})\n` +
+          `   🆔 <code>${escapeHtml(check.chat.chatId)}</code>\n` +
+          `   ✅ Connectivity: Reachable\n` +
+          `   ❌ Bot Admin Status: <b>NOT ADMIN</b> (<code>${escapeHtml(check.botStatus)}</code>)\n` +
+          `   🛠️ Fix: ${escapeHtml(check.fixHint)}\n\n`;
       } else {
-        text += `❌ <b>${escapeHtml(ch.title)}</b> (<code>${escapeHtml(ch.chatId)}</code>) — <i>${escapeHtml(check.error)}</i>\n`;
+        const permLine = ch.isRequestToJoin && !check.canInviteUsers
+          ? `   ⚠️ Join-Request Permission: <b>Missing "Invite Users via Link"</b>\n   🛠️ Fix: ${escapeHtml(check.fixHint)}\n`
+          : `   ✅ Permissions: Ready for verification${ch.isRequestToJoin ? ' & chat_join_request' : ''}\n`;
+        text +=
+          `${i + 1}. ✅ <b>${escapeHtml(check.chat.title)}</b> (${modeTag})\n` +
+          `   🆔 <code>${escapeHtml(check.chat.chatId)}</code>\n` +
+          `   🛡️ Bot Status: <b>${escapeHtml(check.botStatus.toUpperCase())}</b>\n` +
+          `${permLine}\n`;
       }
     }
   }
@@ -292,8 +415,8 @@ export async function handleAdminForceChannelTest(env, callbackQuery) {
   await editOrSend(env, chatId, msgId, text, {
     reply_markup: {
       inline_keyboard: [
+        [{ text: '🔄 Re-run Diagnostics', callback_data: 'adm:fj_test' }],
         [{ text: '⬅️ Back to Force Channels', callback_data: 'adm:force_channels' }],
-        [{ text: '⬅️ Admin Panel', callback_data: 'adm:menu' }],
       ],
     },
   });

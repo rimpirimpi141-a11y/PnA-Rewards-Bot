@@ -12,7 +12,7 @@ import {
   getSettings,
   hasAdminPermission,
 } from '../database.js';
-import { adminBackKeyboard } from '../keyboards.js';
+import { adminActionKeyboard } from '../keyboards.js';
 import { editOrSend, sendMessage } from '../telegram.js';
 
 /**
@@ -63,7 +63,7 @@ export async function handleAdminStatistics(env, adminId, chatId, messageId = nu
     `🕒 Snapshot: <i>${formatIST(Date.now(), env)}</i>`;
 
   await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminBackKeyboard([
+    reply_markup: adminActionKeyboard([
       [{ text: '🔄 Refresh Statistics', callback_data: 'adm:stats' }],
     ]),
   });

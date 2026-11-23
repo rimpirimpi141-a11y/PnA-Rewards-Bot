@@ -87,6 +87,12 @@ export const DEFAULT_SETTINGS = {
   updatedAt: null,
 };
 
+export const BUTTON_STYLES = {
+  SUCCESS: 'success', // GREEN
+  PRIMARY: 'primary', // BLUE
+  DANGER: 'danger', // RED
+};
+
 export const MENU_BUTTONS = {
   BALANCE: '💰 My Balance',
   REFER: '👥 Refer & Earn',
@@ -98,6 +104,22 @@ export const MENU_BUTTONS = {
   ADMIN_PANEL: '👑 Admin Panel',
   MAIN_MENU: '🏠 Main Menu',
   CANCEL: '❌ Cancel',
+};
+
+export const ADMIN_BUTTONS = {
+  ADD_VOUCHER: '➕ Add Voucher',
+  PENDING_REQUESTS: '📋 Pending Requests',
+  FORCE_CHANNELS: '📢 Force Channels',
+  SETTINGS: '⚙️ Settings',
+  USERS_LIST: '👥 Users List',
+  ADD_ADMIN: '👑 Add Admin',
+  STATISTICS: '📊 Statistics',
+  BROADCAST: '📣 Broadcast',
+  VOUCHER_STOCK: '📦 Voucher Stock',
+  VOUCHER_HISTORY: '📝 Voucher History',
+  LOW_STOCK: '🚨 Low Stock',
+  MAINTENANCE: '🔧 Maintenance',
+  ACTIVITY_LOGS: '📜 Activity Logs',
 };
 
 export const ACTIVITY_ACTIONS = {

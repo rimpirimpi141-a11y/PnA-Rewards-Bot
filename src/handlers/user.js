@@ -130,11 +130,7 @@ export async function handleUserHistoryView(env, tgUser, chatId, messageId = nul
 
   await editOrSend(env, chatId, messageId, text, {
     reply_markup: {
-      inline_keyboard: [
-        [{ text: '💸 Withdraw Now', callback_data: 'usr:withdraw' }],
-        [{ text: '👤 Back to Profile', callback_data: 'usr:profile' }],
-        [{ text: '🏠 Back to Main Menu', callback_data: 'usr:home' }],
-      ],
+      inline_keyboard: [[{ text: '👤 Back to Profile', callback_data: 'usr:profile' }]],
     },
   });
 }

@@ -134,6 +134,18 @@ export async function setCachedBotUsername(env, username) {
   });
 }
 
+export async function getCachedBotId(env) {
+  const cached = await assertKV(env).get('meta:bot_id');
+  return cached ? String(cached).trim() : '';
+}
+
+export async function setCachedBotId(env, botId) {
+  if (!botId) return;
+  await assertKV(env).put('meta:bot_id', String(botId).trim(), {
+    expirationTtl: 86400,
+  });
+}
+
 // ----------------------------------------------------------------------------
 // Global Settings
 // ----------------------------------------------------------------------------
@@ -680,6 +692,38 @@ export async function getForceChannels(env) {
 
 export async function saveForceChannels(env, channels) {
   await kvPutJson(env, 'force_channels:list', Array.isArray(channels) ? channels : []);
+}
+
+// ----------------------------------------------------------------------------
+// Pending Join Requests Collection (Request-to-Join Force Channels)
+// Never treated as completed membership; used only for user status feedback.
+// ----------------------------------------------------------------------------
+
+function joinRequestKey(chatId, userId) {
+  return `join_req:${String(chatId)}:${String(userId)}`;
+}
+
+export async function recordPendingJoinRequest(env, chatId, userId, details = {}) {
+  const record = {
+    chatId: String(chatId),
+    userId: String(userId),
+    inviteLink: details.inviteLink || '',
+    requestedAt: Date.now(),
+    status: 'pending',
+  };
+  // Retain pending join-request awareness for 14 days unless cleared earlier on approval/rejection
+  await kvPutJson(env, joinRequestKey(chatId, userId), record, {
+    expirationTtl: 14 * 24 * 60 * 60,
+  });
+  return record;
+}
+
+export async function getPendingJoinRequest(env, chatId, userId) {
+  return kvGetJson(env, joinRequestKey(chatId, userId), null);
+}
+
+export async function clearPendingJoinRequest(env, chatId, userId) {
+  await kvDelete(env, joinRequestKey(chatId, userId));
 }
 
 // ----------------------------------------------------------------------------

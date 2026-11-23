@@ -20,7 +20,7 @@ import {
   saveBroadcastRecord,
   setUserState,
 } from '../database.js';
-import { cancelInputKeyboard, mainMenuKeyboard } from '../keyboards.js';
+import { adminReplyKeyboard, cancelInputKeyboard } from '../keyboards.js';
 import { logAdminActivity } from '../services/activity-log.js';
 import {
   answerCallbackQuery,
@@ -52,7 +52,7 @@ export async function handleAdminBroadcastStart(env, adminId, chatId) {
       `• GIFs / Animations / Documents with captions\n\n` +
       `<i>You will see a recipient count and confirmation screen before anything is sent.</i>\n\n` +
       `Tap <b>❌ Cancel</b> to abort.`,
-    { reply_markup: cancelInputKeyboard() }
+    { reply_markup: cancelInputKeyboard(true) }
   );
 }
 
@@ -147,7 +147,7 @@ export async function handleAdminBroadcastComposeInput(env, message) {
     `Are you sure you want to broadcast this message?`;
 
   await sendMessage(env, chatId, '✅ Broadcast draft prepared.', {
-    reply_markup: mainMenuKeyboard(true),
+    reply_markup: adminReplyKeyboard(),
   });
 
   await sendMessage(env, chatId, text, {
@@ -180,11 +180,12 @@ export async function handleAdminBroadcastCancel(env, callbackQuery, broadcastId
   }
 
   await answerCallbackQuery(env, callbackQuery.id, 'Broadcast cancelled.');
-  await editMessageText(env, chatId, msgId, `❌ Broadcast <code>${escapeHtml(broadcastId)}</code> was cancelled.`, {
-    reply_markup: {
-      inline_keyboard: [[{ text: '⬅️ Back to Admin Panel', callback_data: 'adm:menu' }]],
-    },
-  });
+  await editMessageText(
+    env,
+    chatId,
+    msgId,
+    `❌ Broadcast <code>${escapeHtml(broadcastId)}</code> was cancelled.`
+  );
 }
 
 /**
@@ -327,12 +328,7 @@ export async function handleAdminBroadcastConfirm(env, callbackQuery, broadcastI
         `✅ <b>Successful Deliveries:</b> <b>${sent}</b>\n` +
         `❌ <b>Failed Deliveries:</b> <b>${failed}</b>\n` +
         `🚫 <b>Marked Blocked (Skipped Future):</b> <b>${newlyBlocked}</b>\n` +
-        `🕒 <b>Finished At:</b> ${formatIST(record.completedAt, env)}`,
-      {
-        reply_markup: {
-          inline_keyboard: [[{ text: '⬅️ Back to Admin Panel', callback_data: 'adm:menu' }]],
-        },
-      }
+        `🕒 <b>Finished At:</b> ${formatIST(record.completedAt, env)}`
     );
   };
 

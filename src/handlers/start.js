@@ -26,20 +26,73 @@ import {
 import { answerCallbackQuery, editMessageText, sendMessage } from '../telegram.js';
 
 /**
- * Send the force-join gate prompt showing all required channels + VERIFY button.
+ * Build detailed per-channel force-join message so users know exactly
+ * which channels are joined, which still need joining, and which are
+ * awaiting channel administrator approval (Request-to-Join).
  */
-export async function sendForceJoinPrompt(env, chatId, channels, messageId = null) {
-  const listText = channels
-    .map((ch, idx) => `${idx + 1}. 📢 <b>${escapeHtml(ch.title || `Channel ${idx + 1}`)}</b>`)
-    .join('\n');
+function buildForceJoinMessage(fjResult, isRetry = false) {
+  const pendingSet = new Set(fjResult.pendingChannels.map((p) => p.channel.id));
+  const joinedSet = new Set(fjResult.joinedChannels.map((c) => c.id));
+  const errorMap = new Map(fjResult.permissionErrorChannels.map((e) => [e.channel.id, e.error]));
 
-  const text =
-    `${buildHeader('🔐', 'JOIN REQUIRED CHANNELS')}\n` +
-    `To unlock <b>${BOT_BRAND}</b> and start earning rewards, please join all required channels below:\n\n` +
-    `${listText}\n\n` +
-    `👇 Join every channel above, then tap <b>✅ JOINED - VERIFY</b>.`;
+  const lines = fjResult.channels.map((ch, idx) => {
+    const title = escapeHtml(ch.title || `Channel ${idx + 1}`);
+    const reqTag = ch.isRequestToJoin ? ' <i>(Approval Required)</i>' : '';
 
-  const extra = { reply_markup: forceJoinKeyboard(channels) };
+    if (joinedSet.has(ch.id)) {
+      return `${idx + 1}. ✅ <b>${title}</b> — Joined`;
+    }
+    if (pendingSet.has(ch.id)) {
+      return `${idx + 1}. ⏳ <b>${title}</b> — <b>Join Request Pending Admin Approval</b>`;
+    }
+    if (errorMap.has(ch.id)) {
+      return `${idx + 1}. ⚠️ <b>${title}</b> — Verification unavailable (channel admin setup required)`;
+    }
+    return `${idx + 1}. ❌ <b>${title}</b>${reqTag} — Not Joined`;
+  });
+
+  const header = isRetry
+    ? buildHeader('⚠️', 'MEMBERSHIP NOT VERIFIED YET')
+    : buildHeader('🔐', 'JOIN REQUIRED CHANNELS');
+
+  let notice = '';
+  if (fjResult.pendingChannels.length > 0) {
+    notice +=
+      `\n\n⏳ <b>Pending Join Request Detected:</b>\n` +
+      `Your join request has been submitted, but <b>channel administrator approval is still awaited</b>.\n` +
+      `A pending request does not unlock the bot. Once a channel admin approves your request, tap <b>✅ VERIFY MEMBERSHIP</b> again!`;
+  }
+
+  if (fjResult.permissionErrorChannels.length > 0) {
+    notice +=
+      `\n\n⚠️ <i>One or more channels could not be verified due to channel permission settings. Please try again shortly or contact Support.</i>`;
+  }
+
+  const footer =
+    fjResult.notJoinedChannels.length > 0
+      ? `👇 Join every remaining channel below, then tap <b>✅ VERIFY MEMBERSHIP</b>.`
+      : `👇 Once your channel join request is approved, tap <b>✅ VERIFY MEMBERSHIP</b> to unlock access.`;
+
+  return (
+    `${header}\n` +
+    `To unlock <b>${BOT_BRAND}</b> and start earning rewards, you must be an active member of all required channels:\n\n` +
+    `${lines.join('\n')}` +
+    `${notice}\n\n` +
+    `${footer}`
+  );
+}
+
+/**
+ * Send the force-join gate prompt showing missing channels + ✅ VERIFY MEMBERSHIP.
+ */
+export async function sendForceJoinPrompt(env, chatId, fjResult, messageId = null, isRetry = false) {
+  const text = buildForceJoinMessage(fjResult, isRetry);
+  const channelsToShow =
+    fjResult.missingChannels && fjResult.missingChannels.length > 0
+      ? fjResult.missingChannels
+      : fjResult.channels;
+  const extra = { reply_markup: forceJoinKeyboard(channelsToShow) };
+
   if (messageId) {
     return editMessageText(env, chatId, messageId, text, extra);
   }
@@ -51,7 +104,7 @@ export async function sendForceJoinPrompt(env, chatId, channels, messageId = nul
  * Checks:
  *  1. Account exists & not banned
  *  2. Maintenance Mode (admins bypass)
- *  3. Force-Join channel membership (admins bypass)
+ *  3. Force-Join channel membership (never bypassed for normal users)
  */
 export async function ensureUserAccess(env, tgUser, chatId) {
   const { user } = await createOrUpdateUserFromTelegram(env, tgUser);
@@ -72,14 +125,14 @@ export async function ensureUserAccess(env, tgUser, chatId) {
     return { allowed: false, user, isAdminUser: false };
   }
 
-  // Re-verify force-join membership whenever channels are configured
+  // Always re-verify membership via Telegram getChatMember when force channels exist
   const fj = await verifyUserForceJoin(env, user.id, { bypassForAdmin: true });
   if (!fj.joinedAll) {
     if (user.forceJoinVerified) {
       user.forceJoinVerified = false;
       await saveUser(env, user);
     }
-    await sendForceJoinPrompt(env, chatId, fj.missingChannels);
+    await sendForceJoinPrompt(env, chatId, fj, null, false);
     return { allowed: false, user, isAdminUser: adminUser };
   }
 
@@ -92,7 +145,7 @@ export async function ensureUserAccess(env, tgUser, chatId) {
 }
 
 /**
- * Send Main Menu welcome confirmation card + persistent ReplyKeyboard.
+ * Send Main Menu welcome confirmation card + colourful persistent ReplyKeyboard.
  */
 export async function sendMainMenu(env, chatId, user, isAdminUser = false, customIntro = '') {
   const safeName = escapeHtml(user?.firstName || 'Friend');
@@ -144,7 +197,7 @@ export async function handleStartCommand(env, message, startPayload = '') {
   // Check force-join channels
   const fj = await verifyUserForceJoin(env, user.id, { bypassForAdmin: true });
   if (!fj.joinedAll) {
-    await sendForceJoinPrompt(env, chatId, fj.missingChannels);
+    await sendForceJoinPrompt(env, chatId, fj, null, false);
     return;
   }
 
@@ -168,7 +221,7 @@ export async function handleStartCommand(env, message, startPayload = '') {
 }
 
 /**
- * Handle "✅ JOINED - VERIFY" callback query (`fj:verify`).
+ * Handle "✅ VERIFY MEMBERSHIP" callback query (`fj:verify`).
  */
 export async function handleVerifyForceJoinCallback(env, callbackQuery) {
   const tgUser = callbackQuery.from;
@@ -184,24 +237,12 @@ export async function handleVerifyForceJoinCallback(env, callbackQuery) {
     return;
   }
 
-  await answerCallbackQuery(env, callbackQuery.id, '🔍 Checking your channel membership...');
+  await answerCallbackQuery(env, callbackQuery.id, '🔍 Verifying your channel membership...');
   await playVerificationAnimation(env, chatId, msgId);
 
   const fj = await verifyUserForceJoin(env, user.id, { bypassForAdmin: true });
   if (!fj.joinedAll) {
-    const missingNames = fj.missingChannels
-      .map((c, idx) => `❌ ${escapeHtml(c.title || `Channel ${idx + 1}`)}`)
-      .join('\n');
-
-    const failText =
-      `${buildHeader('⚠️', 'MEMBERSHIP NOT VERIFIED')}\n` +
-      `You have not joined all required channels yet:\n\n` +
-      `${missingNames}\n\n` +
-      `👇 Please join all channels below and tap <b>✅ JOINED - VERIFY</b> again.`;
-
-    await editMessageText(env, chatId, msgId, failText, {
-      reply_markup: forceJoinKeyboard(fj.missingChannels),
-    });
+    await sendForceJoinPrompt(env, chatId, fj, msgId, true);
     return;
   }
 
@@ -210,7 +251,7 @@ export async function handleVerifyForceJoinCallback(env, callbackQuery) {
   freshUser.forceJoinVerified = true;
   await saveUser(env, freshUser);
 
-  // Credit pending referral immediately upon verification
+  // Credit pending referral immediately upon confirmed membership
   await processPendingReferral(env, freshUser.id);
 
   await editMessageText(

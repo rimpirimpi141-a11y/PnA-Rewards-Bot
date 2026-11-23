@@ -24,9 +24,9 @@ import {
   updateSettings,
 } from '../database.js';
 import {
-  adminBackKeyboard,
+  adminActionKeyboard,
+  adminReplyKeyboard,
   cancelInputKeyboard,
-  mainMenuKeyboard,
   paginationRow,
   voucherCategorySelectKeyboard,
 } from '../keyboards.js';
@@ -95,7 +95,7 @@ export async function handleAdminAddVoucherCategory(env, callbackQuery, category
       `✅ Whitespace & blank lines are cleaned automatically\n` +
       `🛡️ Global duplicate codes are rejected automatically\n\n` +
       `Tap <b>❌ Cancel</b> to abort.`,
-    { reply_markup: cancelInputKeyboard() }
+    { reply_markup: cancelInputKeyboard(true) }
   );
 }
 
@@ -127,7 +127,7 @@ export async function handleAdminBulkVoucherInput(env, message, state) {
 
   if (!result.ok) {
     await sendMessage(env, chatId, `❌ <b>Upload Failed:</b> ${escapeHtml(result.error)}`, {
-      reply_markup: mainMenuKeyboard(true),
+      reply_markup: adminReplyKeyboard(),
     });
     return;
   }
@@ -147,16 +147,7 @@ export async function handleAdminBulkVoucherInput(env, message, state) {
     `📦 <b>Current Category Stock:</b> <b>${result.currentStock}</b> (${stockBadge})`;
 
   await sendMessage(env, chatId, text, {
-    reply_markup: mainMenuKeyboard(true),
-  });
-  await sendMessage(env, chatId, '👇 Quick Voucher Actions:', {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '➕ Upload More Vouchers', callback_data: 'adm:add_voucher' }],
-        [{ text: '📦 View All Stock', callback_data: 'adm:stock' }],
-        [{ text: '⬅️ Back to Admin Panel', callback_data: 'adm:menu' }],
-      ],
-    },
+    reply_markup: adminReplyKeyboard(),
   });
 }
 
@@ -204,7 +195,7 @@ export async function handleAdminVoucherStock(env, adminId, chatId, messageId = 
   ];
 
   await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminBackKeyboard(extraRows),
+    reply_markup: adminActionKeyboard(extraRows),
   });
 }
 
@@ -321,7 +312,7 @@ export async function handleAdminVoucherHistory(env, adminId, chatId, page = 1, 
   }
 
   await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminBackKeyboard(extraRows),
+    reply_markup: adminActionKeyboard(extraRows),
   });
 }
 
@@ -361,7 +352,7 @@ export async function handleAdminLowStockMenu(env, adminId, chatId, messageId = 
   }
 
   await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminBackKeyboard(rows),
+    reply_markup: adminActionKeyboard(rows),
   });
 }
 
@@ -391,7 +382,7 @@ export async function handleAdminLowStockPrompt(env, callbackQuery, categoryKey)
     `${buildHeader('🚨', `SET ${cat.shortName.toUpperCase()} LOW STOCK THRESHOLD`)}\n` +
       `Enter a whole number (0–1000). Example: <code>5</code>\n\n` +
       `Admins will be alerted when ${escapeHtml(cat.name)} stock reaches this number or lower.`,
-    { reply_markup: cancelInputKeyboard() }
+    { reply_markup: cancelInputKeyboard(true) }
   );
 }
 
@@ -432,7 +423,7 @@ export async function handleAdminLowStockInput(env, message, state) {
     env,
     chatId,
     `✅ <b>${escapeHtml(cat.name)}</b> low-stock threshold updated to <b>${num}</b>.`,
-    { reply_markup: mainMenuKeyboard(true) }
+    { reply_markup: adminReplyKeyboard() }
   );
   await handleAdminLowStockMenu(env, adminId, chatId);
 }

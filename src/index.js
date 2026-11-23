@@ -2,9 +2,10 @@
 // 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Cloudflare Workers Telegram Webhook Entrypoint
 // ============================================================================
 
-import { BOT_BRAND, MENU_BUTTONS, getWebhookPath } from './config.js';
+import { ADMIN_BUTTONS, BOT_BRAND, MENU_BUTTONS, getWebhookPath } from './config.js';
 import {
   claimUpdateId,
+  clearPendingJoinRequest,
   clearUserState,
   getForceChannels,
   getUser,
@@ -14,15 +15,23 @@ import {
   saveUser,
 } from './database.js';
 import {
+  handleAdminActivityLogs,
   handleAdminCallback,
+  handleAdminMaintenanceMenu,
+  handleAdminManagementMenu,
   handleAdminPanel,
+  handleAdminPendingRequests,
+  handleAdminSettingsMenu,
   handleAdminStateInput,
+  handleAdminUsersList,
 } from './handlers/admin.js';
 import {
   handleDailyBonusClaimCallback,
   handleDailyBonusHistoryCallback,
   handleDailyBonusView,
 } from './handlers/bonus.js';
+import { handleAdminBroadcastStart } from './handlers/broadcast.js';
+import { handleAdminForceChannelsMenu } from './handlers/forcejoin.js';
 import { handleReferralListView, handleReferralView } from './handlers/referral.js';
 import {
   ensureUserAccess,
@@ -30,6 +39,7 @@ import {
   handleVerifyForceJoinCallback,
   sendMainMenu,
 } from './handlers/start.js';
+import { handleAdminStatistics } from './handlers/statistics.js';
 import {
   handleBalanceView,
   handleProfileView,
@@ -38,10 +48,22 @@ import {
   handleUserHistoryView,
 } from './handlers/user.js';
 import {
+  handleAdminAddVoucherMenu,
+  handleAdminLowStockMenu,
+  handleAdminVoucherHistory,
+  handleAdminVoucherStock,
+} from './handlers/voucher.js';
+import {
   handleWithdrawCategorySelect,
   handleWithdrawConfirm,
   handleWithdrawMenu,
 } from './handlers/withdrawal.js';
+import { adminReplyKeyboard } from './keyboards.js';
+import {
+  handleIncomingJoinRequest,
+  isActiveChannelMember,
+  matchesConfiguredChannel,
+} from './services/membership.js';
 import {
   answerCallbackQuery,
   sendMessage,
@@ -78,26 +100,39 @@ async function handleMyChatMemberUpdate(env, update) {
 }
 
 /**
- * Sync force-join verified status if Telegram emits a chat_member leave event
- * on one of the configured force-join channels.
+ * Sync force-join status and pending join-request records when Telegram emits
+ * a `chat_member` event on a configured force-join channel (e.g., approved or left).
  */
 async function handleChatMemberUpdate(env, update) {
   const cm = update.chat_member;
   if (!cm || !cm.chat?.id || !cm.new_chat_member?.user?.id) return;
 
-  const newStatus = cm.new_chat_member.status;
-  if (newStatus === 'left' || newStatus === 'kicked') {
-    const channels = await getForceChannels(env);
-    const matchesForceChannel = channels.some(
-      (c) => String(c.chatId) === String(cm.chat.id)
-    );
-    if (matchesForceChannel) {
-      const user = await getUser(env, cm.new_chat_member.user.id);
-      if (user && user.forceJoinVerified) {
-        user.forceJoinVerified = false;
-        await saveUser(env, user);
-      }
+  const channels = await getForceChannels(env);
+  const matched = channels.find((c) => matchesConfiguredChannel(c, cm.chat));
+  if (!matched) return;
+
+  const targetUserId = String(cm.new_chat_member.user.id);
+  const incomingChatId = String(cm.chat.id);
+
+  if (isActiveChannelMember(cm.new_chat_member)) {
+    // Request approved or user joined -> clear any pending join request marker
+    await clearPendingJoinRequest(env, incomingChatId, targetUserId);
+    if (String(matched.chatId) !== incomingChatId) {
+      await clearPendingJoinRequest(env, matched.chatId, targetUserId);
     }
+    return;
+  }
+
+  // User left, was kicked, or was restricted without membership
+  await clearPendingJoinRequest(env, incomingChatId, targetUserId);
+  if (String(matched.chatId) !== incomingChatId) {
+    await clearPendingJoinRequest(env, matched.chatId, targetUserId);
+  }
+
+  const user = await getUser(env, targetUserId);
+  if (user && user.forceJoinVerified) {
+    user.forceJoinVerified = false;
+    await saveUser(env, user);
   }
 }
 
@@ -121,13 +156,13 @@ async function handleCallbackQuery(env, callbackQuery, ctx) {
     return;
   }
 
-  // Admin panel & admin workflows
+  // Admin workflows & item actions
   if (data.startsWith('adm:')) {
     await handleAdminCallback(env, callbackQuery, ctx);
     return;
   }
 
-  // User navigation callbacks
+  // User secondary callbacks
   if (data === 'usr:home') {
     await clearUserState(env, tgUser.id);
     await answerCallbackQuery(env, callbackQuery.id);
@@ -212,11 +247,70 @@ async function handleCallbackQuery(env, callbackQuery, ctx) {
 }
 
 /**
- * Route all private Telegram message updates (commands, buttons, media, states).
+ * Route all 13 Admin Panel persistent ReplyKeyboard buttons (strictly admin-verified).
+ */
+async function tryHandleAdminReplyButton(env, tgUser, chatId, text) {
+  const adminValues = Object.values(ADMIN_BUTTONS);
+  if (!adminValues.includes(text)) return false;
+
+  const userId = String(tgUser.id);
+  if (!(await isAdmin(userId, env))) {
+    await sendMessage(env, chatId, '🚫 Access denied. Authorized administrators only.');
+    return true;
+  }
+
+  await clearUserState(env, userId);
+
+  switch (text) {
+    case ADMIN_BUTTONS.ADD_VOUCHER:
+      await handleAdminAddVoucherMenu(env, userId, chatId);
+      return true;
+    case ADMIN_BUTTONS.PENDING_REQUESTS:
+      await handleAdminPendingRequests(env, userId, chatId, 1);
+      return true;
+    case ADMIN_BUTTONS.FORCE_CHANNELS:
+      await handleAdminForceChannelsMenu(env, userId, chatId);
+      return true;
+    case ADMIN_BUTTONS.SETTINGS:
+      await handleAdminSettingsMenu(env, userId, chatId);
+      return true;
+    case ADMIN_BUTTONS.USERS_LIST:
+      await handleAdminUsersList(env, userId, chatId, 1);
+      return true;
+    case ADMIN_BUTTONS.ADD_ADMIN:
+      await handleAdminManagementMenu(env, userId, chatId);
+      return true;
+    case ADMIN_BUTTONS.STATISTICS:
+      await handleAdminStatistics(env, userId, chatId);
+      return true;
+    case ADMIN_BUTTONS.BROADCAST:
+      await handleAdminBroadcastStart(env, userId, chatId);
+      return true;
+    case ADMIN_BUTTONS.VOUCHER_STOCK:
+      await handleAdminVoucherStock(env, userId, chatId);
+      return true;
+    case ADMIN_BUTTONS.VOUCHER_HISTORY:
+      await handleAdminVoucherHistory(env, userId, chatId, 1);
+      return true;
+    case ADMIN_BUTTONS.LOW_STOCK:
+      await handleAdminLowStockMenu(env, userId, chatId);
+      return true;
+    case ADMIN_BUTTONS.MAINTENANCE:
+      await handleAdminMaintenanceMenu(env, userId, chatId);
+      return true;
+    case ADMIN_BUTTONS.ACTIVITY_LOGS:
+      await handleAdminActivityLogs(env, userId, chatId, 1);
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * Route all private Telegram message updates (commands, colourful ReplyKeyboards, media, states).
  */
 async function handleMessage(env, message) {
   if (!message?.from || !message?.chat) return;
-  // Operate strictly in private direct messages with the bot
   if (message.chat.type !== 'private') return;
 
   const tgUser = message.from;
@@ -232,8 +326,31 @@ async function handleMessage(env, message) {
     return;
   }
 
-  // Handle global Cancel / Main Menu escapes cleanly from any state
-  if (text === '/cancel' || text === MENU_BUTTONS.CANCEL || text === MENU_BUTTONS.MAIN_MENU || text === '/menu') {
+  // Handle /admin or 👑 Admin Panel button
+  if (text === '/admin' || text === MENU_BUTTONS.ADMIN_PANEL) {
+    await handleAdminPanel(env, tgUser, chatId);
+    return;
+  }
+
+  // Handle global Cancel escape cleanly (restoring Admin keyboard if cancelling an admin input)
+  if (text === '/cancel' || text === MENU_BUTTONS.CANCEL) {
+    const prevState = await getUserState(env, userId);
+    await clearUserState(env, userId);
+    if (prevState?.type?.startsWith('admin_') && (await isAdmin(userId, env))) {
+      await sendMessage(env, chatId, '❌ Action cancelled. Returned to Admin Panel.', {
+        reply_markup: adminReplyKeyboard(),
+      });
+      return;
+    }
+    const access = await ensureUserAccess(env, tgUser, chatId);
+    if (access.allowed) {
+      await sendMainMenu(env, chatId, access.user, access.isAdminUser);
+    }
+    return;
+  }
+
+  // Handle Return to User Main Menu
+  if (text === MENU_BUTTONS.MAIN_MENU || text === '/menu') {
     await clearUserState(env, userId);
     const access = await ensureUserAccess(env, tgUser, chatId);
     if (access.allowed) {
@@ -242,24 +359,22 @@ async function handleMessage(env, message) {
     return;
   }
 
-  // Handle /admin or 👑 Admin Panel button
-  if (text === '/admin' || text === MENU_BUTTONS.ADMIN_PANEL) {
-    await handleAdminPanel(env, tgUser, chatId);
+  // Route Admin Panel bottom ReplyKeyboard buttons
+  if (await tryHandleAdminReplyButton(env, tgUser, chatId, text)) {
     return;
   }
 
-  // Check active multi-step conversation state (e.g., admin voucher upload, broadcast media, settings)
+  // Check active multi-step conversation state (e.g., bulk vouchers, broadcast, force-join setup)
   const state = await getUserState(env, userId);
   if (state) {
     if (state.type?.startsWith('admin_')) {
       const handled = await handleAdminStateInput(env, message, state);
       if (handled) return;
     }
-    // Stale/unrecognized state: clear safely
     await clearUserState(env, userId);
   }
 
-  // Main menu ReplyKeyboard & slash command routing
+  // Main User Menu ReplyKeyboard & slash command routing
   switch (text) {
     case MENU_BUTTONS.BALANCE:
     case '/balance':
@@ -297,7 +412,6 @@ async function handleMessage(env, message) {
       return;
 
     default: {
-      // Handle unexpected input gracefully without crashing
       const access = await ensureUserAccess(env, tgUser, chatId);
       if (!access.allowed) return;
       const adminFlag = await isAdmin(userId, env);
@@ -321,6 +435,12 @@ async function processTelegramUpdate(env, update, ctx) {
     const claimed = await claimUpdateId(env, update.update_id);
     if (!claimed) return;
 
+    // Handle Request-to-Join updates (records pending status; NEVER marks user joined)
+    if (update.chat_join_request) {
+      await handleIncomingJoinRequest(env, update.chat_join_request);
+      return;
+    }
+
     if (update.my_chat_member) {
       await handleMyChatMemberUpdate(env, update);
       return;
@@ -341,7 +461,6 @@ async function processTelegramUpdate(env, update, ctx) {
       return;
     }
   } catch (err) {
-    // Log sanitized runtime error without leaking tokens or voucher codes
     console.error('Telegram update processing error:', err?.message || String(err));
   }
 }
@@ -379,8 +498,6 @@ export default {
         return jsonResponse({ ok: false, error: 'Invalid Telegram update object' }, 400);
       }
 
-      // Execute update processing in waitUntil so Telegram always receives
-      // a prompt 200 OK response and avoids unnecessary webhook retries.
       if (ctx && typeof ctx.waitUntil === 'function') {
         ctx.waitUntil(processTelegramUpdate(env, update, ctx));
       } else {

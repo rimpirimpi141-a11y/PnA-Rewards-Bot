@@ -25,6 +25,7 @@ import {
   getSettings,
   getUser,
   getUserWithdrawals,
+  getUserState,
   getUsersPage,
   getWithdrawal,
   hasAdminPermission,
@@ -36,8 +37,8 @@ import {
   updateSettings,
 } from '../database.js';
 import {
-  adminBackKeyboard,
-  adminMainKeyboard,
+  adminActionKeyboard,
+  adminReplyKeyboard,
   cancelInputKeyboard,
   mainMenuKeyboard,
   paginationRow,
@@ -60,6 +61,7 @@ import {
   handleAdminForceChannelChatIdInput,
   handleAdminForceChannelDelete,
   handleAdminForceChannelLinkInput,
+  handleAdminForceChannelModeSelect,
   handleAdminForceChannelTest,
   handleAdminForceChannelsMenu,
 } from './forcejoin.js';
@@ -79,9 +81,9 @@ import {
 } from './voucher.js';
 
 /**
- * Main Admin Panel Entry Screen
+ * Main Admin Panel Entry Screen (Persistent Coloured Bottom ReplyKeyboard — No Inline Dashboard)
  */
-export async function handleAdminPanel(env, tgUser, chatId, messageId = null) {
+export async function handleAdminPanel(env, tgUser, chatId) {
   const adminId = String(tgUser.id);
   if (!(await isAdmin(adminId, env))) {
     await sendMessage(env, chatId, '🚫 Access denied. Authorized administrators only.');
@@ -105,10 +107,10 @@ export async function handleAdminPanel(env, tgUser, chatId, messageId = null) {
     `🔧 <b>Maintenance Mode:</b> ${maintBadge}\n` +
     `🕒 <b>Server Time:</b> ${formatIST(Date.now(), env)}\n` +
     `${DIVIDER}\n` +
-    `👇 Select an administrative section below:`;
+    `👇 Use the <b>Admin Panel keyboard</b> at the bottom of your chat to manage the bot.`;
 
-  await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminMainKeyboard(ownerFlag),
+  await sendMessage(env, chatId, text, {
+    reply_markup: adminReplyKeyboard(),
   });
 }
 
@@ -167,7 +169,7 @@ export async function handleAdminPendingRequests(env, adminId, chatId, page = 1,
   rows.push([{ text: '🔄 Refresh List', callback_data: `adm:pending:${safePage}` }]);
 
   await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminBackKeyboard(rows),
+    reply_markup: adminActionKeyboard(rows),
   });
 }
 
@@ -205,7 +207,7 @@ export async function handleAdminInspectWithdrawal(env, callbackQuery, requestId
   const reply_markup =
     w.status === 'pending'
       ? withdrawalAdminDecisionKeyboard(w.id)
-      : adminBackKeyboard([[{ text: '📋 Pending Requests', callback_data: 'adm:pending:1' }]]);
+      : adminActionKeyboard([[{ text: '📋 Pending Requests', callback_data: 'adm:pending:1' }]]);
 
   await editOrSend(env, chatId, msgId, text, { reply_markup });
 }
@@ -250,10 +252,7 @@ export async function handleAdminApproveWithdrawal(env, callbackQuery, requestId
 
   await editOrSend(env, chatId, msgId, text, {
     reply_markup: {
-      inline_keyboard: [
-        [{ text: '📋 View Pending Requests', callback_data: 'adm:pending:1' }],
-        [{ text: '⬅️ Admin Panel', callback_data: 'adm:menu' }],
-      ],
+      inline_keyboard: [[{ text: '📋 View Pending Requests', callback_data: 'adm:pending:1' }]],
     },
   });
 }
@@ -302,7 +301,7 @@ export async function handleAdminRejectExecute(env, adminId, chatId, requestId, 
   const res = await rejectWithdrawalRequest(env, requestId, adminId, reason);
   if (!res.ok) {
     await sendMessage(env, chatId, `❌ <b>Rejection Failed:</b> ${escapeHtml(res.error)}`, {
-      reply_markup: mainMenuKeyboard(true),
+      reply_markup: adminReplyKeyboard(),
     });
     return;
   }
@@ -320,14 +319,11 @@ export async function handleAdminRejectExecute(env, adminId, chatId, requestId, 
   if (messageId) {
     await editOrSend(env, chatId, messageId, text, {
       reply_markup: {
-        inline_keyboard: [
-          [{ text: '📋 View Pending Requests', callback_data: 'adm:pending:1' }],
-          [{ text: '⬅️ Admin Panel', callback_data: 'adm:menu' }],
-        ],
+        inline_keyboard: [[{ text: '📋 View Pending Requests', callback_data: 'adm:pending:1' }]],
       },
     });
   } else {
-    await sendMessage(env, chatId, text, { reply_markup: mainMenuKeyboard(true) });
+    await sendMessage(env, chatId, text, { reply_markup: adminReplyKeyboard() });
   }
 }
 
@@ -369,7 +365,7 @@ export async function handleAdminSettingsMenu(env, adminId, chatId, messageId = 
   ];
 
   await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminBackKeyboard(rows),
+    reply_markup: adminActionKeyboard(rows),
   });
 }
 
@@ -402,7 +398,7 @@ export async function handleAdminSettingPrompt(env, callbackQuery, settingKey) {
     env,
     chatId,
     `${buildHeader('⚙️', 'UPDATE SETTING')}\n${prompts[settingKey]}\n\nTap <b>❌ Cancel</b> to abort.`,
-    { reply_markup: cancelInputKeyboard() }
+    { reply_markup: cancelInputKeyboard(true) }
   );
 }
 
@@ -432,7 +428,7 @@ async function handleAdminSettingInput(env, message, state) {
     );
     await clearUserState(env, adminId);
     await sendMessage(env, chatId, `✅ Referral reward updated to <b>${formatINR(paise)}</b>.`, {
-      reply_markup: mainMenuKeyboard(true),
+      reply_markup: adminReplyKeyboard(),
     });
   } else if (key === 'daily_bonus') {
     const paise = inrToPaise(val);
@@ -453,7 +449,7 @@ async function handleAdminSettingInput(env, message, state) {
       env,
       chatId,
       `✅ Daily bonus updated to <b>${formatINR(paise)}</b>.${note}`,
-      { reply_markup: mainMenuKeyboard(true) }
+      { reply_markup: adminReplyKeyboard() }
     );
   } else if (key === 'min_wd') {
     const paise = inrToPaise(val);
@@ -470,7 +466,7 @@ async function handleAdminSettingInput(env, message, state) {
     );
     await clearUserState(env, adminId);
     await sendMessage(env, chatId, `✅ Minimum withdrawal updated to <b>${formatINR(paise)}</b>.`, {
-      reply_markup: mainMenuKeyboard(true),
+      reply_markup: adminReplyKeyboard(),
     });
   } else if (key === 'voucher_val') {
     const paise = inrToPaise(val);
@@ -490,7 +486,7 @@ async function handleAdminSettingInput(env, message, state) {
       env,
       chatId,
       `✅ Default voucher value updated to <b>${formatINR(paise)}</b>.`,
-      { reply_markup: mainMenuKeyboard(true) }
+      { reply_markup: adminReplyKeyboard() }
     );
   } else if (key === 'support') {
     const clean = val.startsWith('@') ? val : `@${val}`;
@@ -501,7 +497,7 @@ async function handleAdminSettingInput(env, message, state) {
     await updateSettings(env, { supportUsername: clean });
     await clearUserState(env, adminId);
     await sendMessage(env, chatId, `✅ Support handle updated to <b>${escapeHtml(clean)}</b>.`, {
-      reply_markup: mainMenuKeyboard(true),
+      reply_markup: adminReplyKeyboard(),
     });
   } else if (key === 'channel') {
     if (!isValidTelegramUrl(val)) {
@@ -511,7 +507,7 @@ async function handleAdminSettingInput(env, message, state) {
     await updateSettings(env, { updateChannelUrl: val });
     await clearUserState(env, adminId);
     await sendMessage(env, chatId, `✅ Update channel link updated to <b>${escapeHtml(val)}</b>.`, {
-      reply_markup: mainMenuKeyboard(true),
+      reply_markup: adminReplyKeyboard(),
     });
   }
 
@@ -568,7 +564,7 @@ export async function handleAdminUsersList(env, adminId, chatId, page = 1, messa
   rows.push([{ text: '🔍 Search User by Telegram ID', callback_data: 'adm:user_search' }]);
 
   await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminBackKeyboard(rows),
+    reply_markup: adminActionKeyboard(rows),
   });
 }
 
@@ -631,7 +627,7 @@ export async function handleAdminUserDetail(env, adminId, chatId, targetUserId, 
   rows.push([{ text: '⬅️ Back to Users List', callback_data: 'adm:users:1' }]);
 
   await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminBackKeyboard(rows),
+    reply_markup: adminActionKeyboard(rows),
   });
 }
 
@@ -685,7 +681,7 @@ export async function handleAdminManagementMenu(env, adminId, chatId, messageId 
   }
 
   await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminBackKeyboard(rows),
+    reply_markup: adminActionKeyboard(rows),
   });
 }
 
@@ -720,7 +716,7 @@ export async function handleAdminMaintenanceMenu(env, adminId, chatId, messageId
   ];
 
   await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminBackKeyboard(rows),
+    reply_markup: adminActionKeyboard(rows),
   });
 }
 
@@ -759,7 +755,7 @@ export async function handleAdminActivityLogs(env, adminId, chatId, page = 1, me
   rows.push([{ text: '🔄 Refresh Logs', callback_data: `adm:logs:${data.page}` }]);
 
   await editOrSend(env, chatId, messageId, text, {
-    reply_markup: adminBackKeyboard(rows),
+    reply_markup: adminActionKeyboard(rows),
   });
 }
 
@@ -781,7 +777,7 @@ export async function handleAdminCallback(env, callbackQuery, ctx) {
 
   if (data === 'adm:menu') {
     await answerCallbackQuery(env, callbackQuery.id);
-    await handleAdminPanel(env, callbackQuery.from, chatId, msgId);
+    await handleAdminPanel(env, callbackQuery.from, chatId);
     return;
   }
 
@@ -885,7 +881,7 @@ export async function handleAdminCallback(env, callbackQuery, ctx) {
       env,
       chatId,
       `${buildHeader('📝', 'ENTER REJECTION REASON')}\nRequest ID: <code>${escapeHtml(reqId)}</code>\n\nType the rejection reason to send to the user (or tap ❌ Cancel):`,
-      { reply_markup: cancelInputKeyboard() }
+      { reply_markup: cancelInputKeyboard(true) }
     );
     return;
   }
@@ -898,6 +894,17 @@ export async function handleAdminCallback(env, callbackQuery, ctx) {
 
   if (data === 'adm:fj_add') {
     await handleAdminForceChannelAddStart(env, callbackQuery);
+    return;
+  }
+
+  if (data.startsWith('adm:fj_mode:')) {
+    const currentState = await getUserState(env, adminId);
+    await handleAdminForceChannelModeSelect(
+      env,
+      callbackQuery,
+      data.slice('adm:fj_mode:'.length),
+      currentState
+    );
     return;
   }
 
@@ -940,7 +947,7 @@ export async function handleAdminCallback(env, callbackQuery, ctx) {
       env,
       chatId,
       `${buildHeader('🔍', 'SEARCH USER BY TELEGRAM ID')}\nSend the user's numeric Telegram ID (e.g. <code>8838351233</code>):`,
-      { reply_markup: cancelInputKeyboard() }
+      { reply_markup: cancelInputKeyboard(true) }
     );
     return;
   }
@@ -998,7 +1005,7 @@ export async function handleAdminCallback(env, callbackQuery, ctx) {
       env,
       chatId,
       `${buildHeader('👑', 'ADD NEW ADMINISTRATOR')}\nSend the Telegram ID of the user to promote to Admin (e.g. <code>123456789</code>):`,
-      { reply_markup: cancelInputKeyboard() }
+      { reply_markup: cancelInputKeyboard(true) }
     );
     return;
   }
@@ -1093,7 +1100,7 @@ export async function handleAdminCallback(env, callbackQuery, ctx) {
       env,
       chatId,
       `${buildHeader('✏️', 'EDIT MAINTENANCE MESSAGE')}\nSend the new maintenance notice message for users:`,
-      { reply_markup: cancelInputKeyboard() }
+      { reply_markup: cancelInputKeyboard(true) }
     );
     return;
   }
@@ -1161,7 +1168,7 @@ export async function handleAdminStateInput(env, message, state) {
       }
       await clearUserState(env, adminId);
       await sendMessage(env, chatId, `🔍 Search result for <code>${escapeHtml(q)}</code>:`, {
-        reply_markup: mainMenuKeyboard(true),
+        reply_markup: adminReplyKeyboard(),
       });
       await handleAdminUserDetail(env, adminId, chatId, q);
       return true;
@@ -1171,7 +1178,7 @@ export async function handleAdminStateInput(env, message, state) {
       if (!isOwner(adminId, env)) {
         await clearUserState(env, adminId);
         await sendMessage(env, chatId, '👑 Strictly Owner-only action.', {
-          reply_markup: mainMenuKeyboard(true),
+          reply_markup: adminReplyKeyboard(),
         });
         return true;
       }
@@ -1183,7 +1190,7 @@ export async function handleAdminStateInput(env, message, state) {
       if (isOwner(targetId, env)) {
         await clearUserState(env, adminId);
         await sendMessage(env, chatId, '👑 That ID is already the Bot Owner.', {
-          reply_markup: mainMenuKeyboard(true),
+          reply_markup: adminReplyKeyboard(),
         });
         return true;
       }
@@ -1210,7 +1217,7 @@ export async function handleAdminStateInput(env, message, state) {
         env,
         chatId,
         `✅ Telegram ID <code>${escapeHtml(targetId)}</code> has been added as an Administrator!`,
-        { reply_markup: mainMenuKeyboard(true) }
+        { reply_markup: adminReplyKeyboard() }
       );
       await handleAdminManagementMenu(env, adminId, chatId);
       return true;
@@ -1225,7 +1232,7 @@ export async function handleAdminStateInput(env, message, state) {
       await updateSettings(env, { maintenanceMessage: escapeHtml(msg) });
       await clearUserState(env, adminId);
       await sendMessage(env, chatId, '✅ Maintenance message updated.', {
-        reply_markup: mainMenuKeyboard(true),
+        reply_markup: adminReplyKeyboard(),
       });
       await handleAdminMaintenanceMenu(env, adminId, chatId);
       return true;

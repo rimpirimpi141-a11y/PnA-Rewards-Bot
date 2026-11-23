@@ -75,10 +75,7 @@ export async function handleWithdrawCategorySelect(env, callbackQuery, categoryK
     await answerCallbackQuery(env, callbackQuery.id, 'Cannot withdraw right now.', false);
     await editOrSend(env, chatId, msgId, `${buildHeader('⚠️', 'WITHDRAWAL UNAVAILABLE')}\n${check.error}`, {
       reply_markup: {
-        inline_keyboard: [
-          [{ text: '⬅️ Back to Withdraw', callback_data: 'usr:withdraw' }],
-          [{ text: '🏠 Back to Main Menu', callback_data: 'usr:home' }],
-        ],
+        inline_keyboard: [[{ text: '⬅️ Back to Withdraw', callback_data: 'usr:withdraw' }]],
       },
     });
     return;
@@ -126,10 +123,7 @@ export async function handleWithdrawConfirm(env, callbackQuery, categoryKey) {
   if (!res.ok) {
     await editOrSend(env, chatId, msgId, `${buildHeader('❌', 'WITHDRAWAL FAILED')}\n${res.error}`, {
       reply_markup: {
-        inline_keyboard: [
-          [{ text: '⬅️ Back to Withdraw', callback_data: 'usr:withdraw' }],
-          [{ text: '🏠 Back to Main Menu', callback_data: 'usr:home' }],
-        ],
+        inline_keyboard: [[{ text: '⬅️ Back to Withdraw', callback_data: 'usr:withdraw' }]],
       },
     });
     return;
@@ -149,10 +143,7 @@ export async function handleWithdrawConfirm(env, callbackQuery, categoryKey) {
 
   await editOrSend(env, chatId, msgId, text, {
     reply_markup: {
-      inline_keyboard: [
-        [{ text: '📜 My Withdrawals', callback_data: 'usr:history' }],
-        [{ text: '🏠 Back to Main Menu', callback_data: 'usr:home' }],
-      ],
+      inline_keyboard: [[{ text: '📜 My Withdrawals', callback_data: 'usr:history' }]],
     },
   });
 }

@@ -26,7 +26,13 @@ const payload = {
   url: WEBHOOK_URL,
   secret_token: WEBHOOK_SECRET,
   drop_pending_updates: true,
-  allowed_updates: ['message', 'callback_query', 'my_chat_member', 'chat_member'],
+  allowed_updates: [
+    'message',
+    'callback_query',
+    'my_chat_member',
+    'chat_member',
+    'chat_join_request',
+  ],
 };
 
 const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {

@@ -175,7 +175,7 @@ curl -X POST "https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook" \
     "url": "https://pna-rewards-bot.<your-subdomain>.workers.dev/webhook",
     "secret_token": "<YOUR_EXACT_WEBHOOK_SECRET>",
     "drop_pending_updates": true,
-    "allowed_updates": ["message", "callback_query", "my_chat_member", "chat_member"]
+    "allowed_updates": ["message", "callback_query", "my_chat_member", "chat_member", "chat_join_request"]
   }'
 ```
 
@@ -201,9 +201,13 @@ Open the bot as Owner (`8838351233`) or an authorized Admin and send `/admin` (o
    - Review all pending withdrawals or act directly on instant withdrawal alert messages.
    - **✅ APPROVE**: Locks request & 1 unused voucher, delivers the code privately to the user, updates balances & 24h cooldown, writes permanent Voucher History, and checks Low Stock Alerts.
    - **❌ REJECT**: Reject immediately or enter a custom rejection reason; automatically refunds 100% of reserved balance to the user.
-3. **📢 Force Channels**
-   - Add public (`@channel`) or private (`-100...`) channels with custom invite links.
-   - Add the bot as an **Admin** in each required channel, then tap **🩺 Test Channel Permissions** to confirm connectivity.
+3. **📢 Force Channels (Public, Private & Request-to-Join)**
+   - Store **Channel ID** (`-100...` or public `@username`) separately from the **Invite URL** (Normal or Request-to-Join).
+   - **Mandatory Bot Admin Requirement:** Add this bot as an **Administrator** in every configured force-join channel (and enable **"Invite Users via Link"** for Request-to-Join channels) so `getChatMember` verification and `chat_join_request` / `chat_member` updates work reliably.
+   - Tap **🩺 Test Channels & Bot Admin Status** to inspect connectivity, actual bot administrator status, and actionable fix hints.
+   - Users who apply via a Request-to-Join link are recorded as *Pending Channel Approval* and are **never** granted access until a channel admin approves them and `getChatMember` confirms active membership.
+
+> **Colourful ReplyKeyboard Compatibility Note:** Both the User Panel and Admin Panel stay persistently at the bottom of the Telegram chat (`ReplyKeyboardMarkup` with `resize_keyboard: true`, `is_persistent: true`) and send Telegram Bot API `KeyboardButton` `"style"` fields (`"success"` = Green, `"primary"` = Blue, `"danger"` = Red) directly in raw JSON. Users on older Telegram apps that do not yet support the Telegram Bot API `KeyboardButton.style` field will still see working labeled buttons rendered in their client's default theme until they update their Telegram client.
 4. **⚙️ Settings**
    - Dynamically update Referral Reward (₹), Daily Bonus (decimal ₹, e.g. `0.20`), Minimum Withdrawal (₹), Default Voucher Value (₹), Support Handle, and Update Channel URL.
 5. **👥 Users List**
