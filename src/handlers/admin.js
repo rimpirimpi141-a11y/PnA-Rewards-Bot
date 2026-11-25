@@ -19,11 +19,13 @@ import {
 } from '../config.js';
 import {
   clearUserState,
+  countPendingWithdrawals,
   getActivityLogsPage,
   getAdminsMap,
-  getPendingWithdrawalIds,
+  getPendingWithdrawalsPage,
   getSettings,
   getUser,
+  getUserBalanceAdjustments,
   getUserWithdrawals,
   getUserState,
   getUsersPage,
@@ -31,10 +33,11 @@ import {
   hasAdminPermission,
   isAdmin,
   isOwner,
-  saveAdminsMap,
-  saveUser,
+  removeAdminRecord,
   setUserState,
   updateSettings,
+  updateUserStatus,
+  upsertAdminRecord,
 } from '../database.js';
 import {
   adminActionKeyboard,
@@ -46,10 +49,23 @@ import {
 } from '../keyboards.js';
 import { logAdminActivity } from '../services/activity-log.js';
 import {
+  logAdminRoleChangeEvent,
+  logUserStatusChangeEvent,
+} from '../services/secretary.js';
+import {
   approveWithdrawalRequest,
   rejectWithdrawalRequest,
 } from '../services/withdrawal-service.js';
 import { answerCallbackQuery, editOrSend, sendMessage } from '../telegram.js';
+import {
+  handleAdminBalanceActionSelect,
+  handleAdminBalanceAmountInput,
+  handleAdminBalanceCancel,
+  handleAdminBalanceConfirm,
+  handleAdminBalanceReasonSubmit,
+  handleAdminBalanceUserIdInput,
+  handleAdminManageBalanceForUser,
+} from './balance-admin.js';
 import {
   handleAdminBroadcastCancel,
   handleAdminBroadcastComposeInput,
@@ -65,6 +81,15 @@ import {
   handleAdminForceChannelTest,
   handleAdminForceChannelsMenu,
 } from './forcejoin.js';
+import {
+  handleAdminSecretaryChannelInput,
+  handleAdminSecretaryChannelPrompt,
+  handleAdminSecretaryMenu,
+  handleAdminSecretaryRetry,
+  handleAdminSecretaryTest,
+  handleAdminSecretaryToggle,
+  handleAdminSecretaryVerify,
+} from './secretary.js';
 import { handleAdminStatistics } from './statistics.js';
 import {
   handleAdminAddVoucherCategory,
@@ -92,9 +117,9 @@ export async function handleAdminPanel(env, tgUser, chatId) {
 
   await clearUserState(env, adminId);
   const ownerFlag = isOwner(adminId, env);
-  const [settings, pendingIds] = await Promise.all([
+  const [settings, pendingCount] = await Promise.all([
     getSettings(env),
-    getPendingWithdrawalIds(env),
+    countPendingWithdrawals(env),
   ]);
 
   const roleBadge = ownerFlag ? '👑 Owner (Full Control)' : '🛡️ Administrator';
@@ -103,7 +128,7 @@ export async function handleAdminPanel(env, tgUser, chatId) {
   const text =
     `${buildHeader('👑', `${BOT_BRAND} — ADMIN PANEL`)}\n` +
     `🪪 <b>Role:</b> ${roleBadge}\n` +
-    `📋 <b>Pending Withdrawals:</b> <b>${pendingIds.length}</b>\n` +
+    `📋 <b>Pending Withdrawals:</b> <b>${pendingCount}</b>\n` +
     `🔧 <b>Maintenance Mode:</b> ${maintBadge}\n` +
     `🕒 <b>Server Time:</b> ${formatIST(Date.now(), env)}\n` +
     `${DIVIDER}\n` +
@@ -124,20 +149,11 @@ export async function handleAdminPendingRequests(env, adminId, chatId, page = 1,
     return;
   }
 
-  const allPendingIds = await getPendingWithdrawalIds(env);
-  const validPending = [];
-  for (const id of allPendingIds) {
-    const w = await getWithdrawal(env, id);
-    if (w && w.status === 'pending') {
-      validPending.push(w);
-    }
-  }
-
-  const pageSize = 5;
-  const total = validPending.length;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const safePage = Math.min(Math.max(1, Number(page) || 1), totalPages);
-  const slice = validPending.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const pageData = await getPendingWithdrawalsPage(env, page, 5);
+  const total = pageData.total;
+  const totalPages = pageData.totalPages;
+  const safePage = pageData.page;
+  const slice = pageData.items;
 
   let text =
     `${buildHeader('📋', 'PENDING WITHDRAWAL REQUESTS')}\n` +
@@ -580,7 +596,12 @@ export async function handleAdminUserDetail(env, adminId, chatId, targetUserId, 
     return;
   }
 
-  const withdrawals = await getUserWithdrawals(env, u.id, 5);
+  const [withdrawals, adjustments, canManageBal] = await Promise.all([
+    getUserWithdrawals(env, u.id, 5),
+    getUserBalanceAdjustments(env, u.id, 5),
+    hasAdminPermission(adminId, 'manageBalances', env),
+  ]);
+
   let wdSummary = '<i>No withdrawals yet.</i>';
   if (withdrawals.length) {
     wdSummary = withdrawals
@@ -588,6 +609,17 @@ export async function handleAdminUserDetail(env, adminId, chatId, targetUserId, 
         (w) =>
           `• <code>${escapeHtml(w.id)}</code> ${formatINR(w.amountPaise)} (${escapeHtml(w.category)}) — <b>${escapeHtml(w.status.toUpperCase())}</b>`
       )
+      .join('\n');
+  }
+
+  let adjSummary = '<i>No manual balance adjustments.</i>';
+  if (adjustments.length) {
+    adjSummary = adjustments
+      .map((a) => {
+        const sign = a.action === 'ADD' ? '+' : '-';
+        const reasonPart = a.reason ? ` — <i>${escapeHtml(a.reason)}</i>` : '';
+        return `• <code>${escapeHtml(a.id)}</code> <b>${sign}${formatINR(a.amountPaise)}</b> (${formatINR(a.balanceBeforePaise)}→${formatINR(a.balanceAfterPaise)}) by <code>${escapeHtml(a.adminId)}</code>${reasonPart}`;
+      })
       .join('\n');
   }
 
@@ -614,9 +646,14 @@ export async function handleAdminUserDetail(env, adminId, chatId, targetUserId, 
     `🎁 <b>Daily Bonuses:</b> ${u.dailyBonusCount || 0} (${formatINR(u.dailyBonusEarningsPaise)})\n` +
     `✅ <b>Total Withdrawn:</b> ${formatINR(u.totalWithdrawnPaise)}\n` +
     `${DIVIDER}\n` +
-    `💸 <b>Recent Withdrawal History:</b>\n${wdSummary}`;
+    `💸 <b>Recent Withdrawal History:</b>\n${wdSummary}\n` +
+    `${DIVIDER}\n` +
+    `💰 <b>Recent Manual Balance Adjustments:</b>\n${adjSummary}`;
 
   const rows = [];
+  if (canManageBal) {
+    rows.push([{ text: '💰 Manage User Balance', callback_data: `adm:bal_user:${u.id}` }]);
+  }
   if (!isOwner(u.id, env)) {
     const toggleBtn =
       u.status === 'banned'
@@ -975,16 +1012,83 @@ export async function handleAdminCallback(env, callbackQuery, ctx) {
       await answerCallbackQuery(env, callbackQuery.id, 'User not found.', true);
       return;
     }
-    target.status = newStatus;
-    await saveUser(env, target);
+    await updateUserStatus(env, targetId, newStatus);
     await logAdminActivity(
       env,
       adminId,
       ACTIVITY_ACTIONS.USER_STATUS_CHANGED,
       `Set user ${targetId} status to ${newStatus}`
     );
+    await logUserStatusChangeEvent(env, { adminId, targetUser: target, newStatus });
     await answerCallbackQuery(env, callbackQuery.id, `User marked ${newStatus}.`, true);
     await handleAdminUserDetail(env, adminId, chatId, targetId, msgId);
+    return;
+  }
+
+  // Manual Balance Management callbacks
+  if (data.startsWith('adm:bal_user:')) {
+    const targetId = data.slice('adm:bal_user:'.length);
+    await answerCallbackQuery(env, callbackQuery.id);
+    await handleAdminManageBalanceForUser(env, adminId, chatId, targetId, msgId);
+    return;
+  }
+
+  if (data.startsWith('adm:bal_act:')) {
+    const parts = data.split(':');
+    const action = parts[2];
+    const targetId = parts[3];
+    await handleAdminBalanceActionSelect(env, callbackQuery, action, targetId);
+    return;
+  }
+
+  if (data === 'adm:bal_skip_reason') {
+    const currentState = await getUserState(env, adminId);
+    await answerCallbackQuery(env, callbackQuery.id);
+    await handleAdminBalanceReasonSubmit(env, adminId, chatId, '', currentState, msgId);
+    return;
+  }
+
+  if (data.startsWith('adm:bal_confirm:')) {
+    const opId = data.slice('adm:bal_confirm:'.length);
+    await handleAdminBalanceConfirm(env, callbackQuery, opId);
+    return;
+  }
+
+  if (data.startsWith('adm:bal_cancel:')) {
+    const opId = data.slice('adm:bal_cancel:'.length);
+    await handleAdminBalanceCancel(env, callbackQuery, opId);
+    return;
+  }
+
+  // Secretary Mode (PnA X Logs) callbacks
+  if (data === 'adm:secretary') {
+    await answerCallbackQuery(env, callbackQuery.id);
+    await handleAdminSecretaryMenu(env, adminId, chatId, msgId);
+    return;
+  }
+
+  if (data === 'adm:sec_verify') {
+    await handleAdminSecretaryVerify(env, callbackQuery);
+    return;
+  }
+
+  if (data === 'adm:sec_test') {
+    await handleAdminSecretaryTest(env, callbackQuery);
+    return;
+  }
+
+  if (data === 'adm:sec_retry') {
+    await handleAdminSecretaryRetry(env, callbackQuery);
+    return;
+  }
+
+  if (data === 'adm:sec_toggle') {
+    await handleAdminSecretaryToggle(env, callbackQuery);
+    return;
+  }
+
+  if (data === 'adm:sec_set_ch') {
+    await handleAdminSecretaryChannelPrompt(env, callbackQuery);
     return;
   }
 
@@ -1020,19 +1124,18 @@ export async function handleAdminCallback(env, callbackQuery, ctx) {
       await answerCallbackQuery(env, callbackQuery.id, '👑 Cannot remove the Bot Owner!', true);
       return;
     }
-    const map = await getAdminsMap(env);
-    if (!map[targetId]) {
+    const removed = await removeAdminRecord(env, targetId);
+    if (!removed) {
       await answerCallbackQuery(env, callbackQuery.id, 'Admin not found.', true);
       return;
     }
-    delete map[targetId];
-    await saveAdminsMap(env, map);
     await logAdminActivity(
       env,
       adminId,
       ACTIVITY_ACTIONS.ADMIN_REMOVED,
       `Removed admin Telegram ID ${targetId}`
     );
+    await logAdminRoleChangeEvent(env, { ownerId: adminId, targetAdminId: targetId, action: 'REMOVED' });
     await answerCallbackQuery(env, callbackQuery.id, `🗑️ Removed admin ${targetId}`, true);
     await handleAdminManagementMenu(env, adminId, chatId, msgId);
     return;
@@ -1153,6 +1256,22 @@ export async function handleAdminStateInput(env, message, state) {
       await handleAdminBroadcastComposeInput(env, message);
       return true;
 
+    case 'admin_bal_user_id':
+      await handleAdminBalanceUserIdInput(env, message);
+      return true;
+
+    case 'admin_bal_amount':
+      await handleAdminBalanceAmountInput(env, message, state);
+      return true;
+
+    case 'admin_bal_reason':
+      await handleAdminBalanceReasonSubmit(env, adminId, chatId, message.text || '', state);
+      return true;
+
+    case 'admin_sec_channel':
+      await handleAdminSecretaryChannelInput(env, message);
+      return true;
+
     case 'admin_wd_reject_reason': {
       const reason = String(message.text || '').trim();
       await clearUserState(env, adminId);
@@ -1195,8 +1314,7 @@ export async function handleAdminStateInput(env, message, state) {
         return true;
       }
       const existingUser = await getUser(env, targetId);
-      const map = await getAdminsMap(env);
-      map[targetId] = {
+      await upsertAdminRecord(env, {
         id: targetId,
         name: existingUser ? formatUserName(existingUser) : `Admin ${targetId}`,
         username: existingUser?.username || '',
@@ -1204,8 +1322,7 @@ export async function handleAdminStateInput(env, message, state) {
         addedAt: Date.now(),
         active: true,
         permissions: { ...DEFAULT_ADMIN_PERMISSIONS },
-      };
-      await saveAdminsMap(env, map);
+      });
       await clearUserState(env, adminId);
       await logAdminActivity(
         env,
@@ -1213,6 +1330,7 @@ export async function handleAdminStateInput(env, message, state) {
         ACTIVITY_ACTIONS.ADMIN_ADDED,
         `Added admin Telegram ID ${targetId}`
       );
+      await logAdminRoleChangeEvent(env, { ownerId: adminId, targetAdminId: targetId, action: 'ADDED' });
       await sendMessage(
         env,
         chatId,

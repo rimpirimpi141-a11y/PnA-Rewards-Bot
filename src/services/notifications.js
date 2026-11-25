@@ -149,3 +149,32 @@ export async function notifyUserWithdrawalRejected(env, withdrawal, refundedBala
   }
   return res;
 }
+
+/**
+ * Notify target user when an admin manually adds or deducts balance.
+ */
+export async function notifyUserBalanceAdjusted(env, adjustment) {
+  const isAdd = adjustment.action === 'ADD';
+  const sign = isAdd ? '+' : '-';
+  const reasonLine = adjustment.reason
+    ? `\n📝 <b>Reason:</b> ${escapeHtml(adjustment.reason)}`
+    : '';
+
+  const text =
+    `${isAdd ? '💰 <b>BALANCE CREDITED BY ADMIN</b>' : '➖ <b>BALANCE DEDUCTED BY ADMIN</b>'}\n` +
+    `${DIVIDER}\n` +
+    `🆔 <b>Reference:</b> <code>${escapeHtml(adjustment.id)}</code>\n` +
+    `💵 <b>Amount:</b> <b>${sign}${formatINR(adjustment.amountPaise)}</b>\n` +
+    `🏦 <b>Previous Balance:</b> ${formatINR(adjustment.balanceBeforePaise)}\n` +
+    `🏦 <b>New Balance:</b> <b>${formatINR(adjustment.balanceAfterPaise)}</b>` +
+    `${reasonLine}\n` +
+    `🕒 <b>Time:</b> ${formatIST(adjustment.createdAt, env)}\n` +
+    `${DIVIDER}\n` +
+    `💡 <i>View this entry anytime under 💰 My Balance → 📜 Transaction History.</i>`;
+
+  const res = await sendMessage(env, adjustment.targetUserId, text);
+  if (res.isBlocked) {
+    await markUserBlocked(env, adjustment.targetUserId);
+  }
+  return res;
+}

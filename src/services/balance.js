@@ -1,8 +1,20 @@
 // ============================================================================
-// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Balance & Ledger Service (Exact Integer Paise Math)
+// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Balance & Ledger Service (Exact Integer Paise Math on D1)
 // ============================================================================
 
-import { getUser, saveUser } from '../database.js';
+import { ACTIVITY_ACTIONS, formatINR } from '../config.js';
+import {
+  executeCreateWithdrawalTransaction,
+  executeDailyBonusClaimTransaction,
+  executeManualBalanceAdjustmentTransaction,
+  executeReferralCreditTransaction,
+  executeRejectWithdrawalTransaction,
+  getUserBalanceAdjustments,
+  getUserLedger,
+} from '../database.js';
+import { logAdminActivity } from './activity-log.js';
+import { notifyUserBalanceAdjusted } from './notifications.js';
+import { logBotErrorEvent, logManualBalanceEvent } from './secretary.js';
 
 export function getBalanceSummary(user) {
   return {
@@ -15,104 +27,72 @@ export function getBalanceSummary(user) {
   };
 }
 
-export async function creditReferralReward(env, referrerId, amountPaise) {
-  const safeAmount = Math.max(0, Math.round(Number(amountPaise || 0)));
-  if (safeAmount <= 0) return null;
-
-  const user = await getUser(env, referrerId);
-  if (!user) return null;
-
-  user.balancePaise = Math.round(Number(user.balancePaise || 0)) + safeAmount;
-  user.totalEarnedPaise = Math.round(Number(user.totalEarnedPaise || 0)) + safeAmount;
-  user.referralEarningsPaise = Math.round(Number(user.referralEarningsPaise || 0)) + safeAmount;
-  user.totalReferrals = Math.round(Number(user.totalReferrals || 0)) + 1;
-
-  return saveUser(env, user);
+export async function getUserLedgerEntries(env, userId, limit = 50) {
+  return getUserLedger(env, userId, limit);
 }
 
-export async function creditDailyBonus(env, userId, amountPaise, claimedAt = Date.now()) {
-  const safeAmount = Math.max(0, Math.round(Number(amountPaise || 0)));
-  if (safeAmount <= 0) return null;
-
-  const user = await getUser(env, userId);
-  if (!user) return null;
-
-  user.balancePaise = Math.round(Number(user.balancePaise || 0)) + safeAmount;
-  user.totalEarnedPaise = Math.round(Number(user.totalEarnedPaise || 0)) + safeAmount;
-  user.dailyBonusEarningsPaise =
-    Math.round(Number(user.dailyBonusEarningsPaise || 0)) + safeAmount;
-  user.lastDailyClaimAt = claimedAt;
-  user.dailyBonusCount = Math.round(Number(user.dailyBonusCount || 0)) + 1;
-
-  return saveUser(env, user);
+export async function getUserManualAdjustments(env, userId, limit = 20) {
+  return getUserBalanceAdjustments(env, userId, limit);
 }
 
 /**
- * Safely deduct & reserve user balance when creating a pending withdrawal.
+ * Execute an audited manual admin balance ADD or DEDUCT operation:
+ *   1. Atomic D1 batch (users + balance_adjustments + immutable ledger)
+ *   2. Admin activity log entry
+ *   3. Secretary Mode log to PnA X Logs
+ *   4. Direct notification to target user
  */
-export async function reserveWithdrawalBalance(env, userId, amountPaise, requestId) {
-  const safeAmount = Math.max(0, Math.round(Number(amountPaise || 0)));
-  const user = await getUser(env, userId);
-  if (!user) return { ok: false, error: 'User account not found.' };
-
-  const available = Math.round(Number(user.balancePaise || 0));
-  if (available < safeAmount) {
-    return { ok: false, error: 'Insufficient available balance.' };
-  }
-
-  user.balancePaise = available - safeAmount;
-  user.pendingWithdrawalPaise =
-    Math.round(Number(user.pendingWithdrawalPaise || 0)) + safeAmount;
-  user.activePendingWithdrawalId = requestId;
-
-  const saved = await saveUser(env, user);
-  return { ok: true, user: saved };
-}
-
-/**
- * Finalize reserved balance into totalWithdrawn upon admin approval.
- */
-export async function finalizeApprovedWithdrawalBalance(
+export async function applyAdminBalanceAdjustment(
   env,
-  userId,
-  amountPaise,
-  requestId,
-  approvedAt = Date.now()
+  { operationId, adminId, targetUserId, action, amountPaise, reason = '' }
 ) {
-  const safeAmount = Math.max(0, Math.round(Number(amountPaise || 0)));
-  const user = await getUser(env, userId);
-  if (!user) return null;
+  const tx = await executeManualBalanceAdjustmentTransaction(env, {
+    operationId,
+    adminId,
+    targetUserId,
+    action,
+    amountPaise,
+    reason,
+    createdAt: Date.now(),
+  });
 
-  user.pendingWithdrawalPaise = Math.max(
-    0,
-    Math.round(Number(user.pendingWithdrawalPaise || 0)) - safeAmount
-  );
-  user.totalWithdrawnPaise = Math.round(Number(user.totalWithdrawnPaise || 0)) + safeAmount;
-  user.withdrawalCount = Math.round(Number(user.withdrawalCount || 0)) + 1;
-  user.lastApprovedWithdrawalAt = approvedAt;
-  if (user.activePendingWithdrawalId === requestId) {
-    user.activePendingWithdrawalId = null;
+  if (!tx.ok) {
+    if (!tx.duplicate) {
+      await logBotErrorEvent(env, {
+        category: 'FINANCIAL_OP_FAILED',
+        summary: `Manual balance ${action} failed: ${tx.error}`,
+        context: `admin=${adminId} target=${targetUserId} amountPaise=${amountPaise} opId=${operationId}`,
+        dedupId: `bal_fail:${operationId}`,
+      });
+    }
+    return tx;
   }
 
-  return saveUser(env, user);
-}
+  const adj = tx.adjustment;
+  const targetUser = tx.user;
+  const actType =
+    adj.action === 'ADD' ? ACTIVITY_ACTIONS.BALANCE_ADDED : ACTIVITY_ACTIONS.BALANCE_DEDUCTED;
+  const sign = adj.action === 'ADD' ? '+' : '-';
+  const reasonSuffix = adj.reason ? ` — Reason: ${adj.reason}` : '';
 
-/**
- * Refund reserved balance back to available balance upon admin rejection.
- */
-export async function refundRejectedWithdrawalBalance(env, userId, amountPaise, requestId) {
-  const safeAmount = Math.max(0, Math.round(Number(amountPaise || 0)));
-  const user = await getUser(env, userId);
-  if (!user) return null;
-
-  user.pendingWithdrawalPaise = Math.max(
-    0,
-    Math.round(Number(user.pendingWithdrawalPaise || 0)) - safeAmount
+  await logAdminActivity(
+    env,
+    adminId,
+    actType,
+    `${adj.action} ${sign}${formatINR(adj.amountPaise)} for user ${adj.targetUserId} (${formatINR(adj.balanceBeforePaise)} → ${formatINR(adj.balanceAfterPaise)}) [${adj.id}]${reasonSuffix}`
   );
-  user.balancePaise = Math.round(Number(user.balancePaise || 0)) + safeAmount;
-  if (user.activePendingWithdrawalId === requestId) {
-    user.activePendingWithdrawalId = null;
-  }
 
-  return saveUser(env, user);
+  await logManualBalanceEvent(env, { adjustment: adj, targetUser });
+  await notifyUserBalanceAdjusted(env, adj);
+
+  return tx;
 }
+
+// Re-export atomic D1 ledger-backed financial transaction helpers
+export {
+  executeCreateWithdrawalTransaction,
+  executeDailyBonusClaimTransaction,
+  executeManualBalanceAdjustmentTransaction,
+  executeReferralCreditTransaction,
+  executeRejectWithdrawalTransaction,
+};

@@ -1,5 +1,5 @@
 // ============================================================================
-// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Manual-Approval Withdrawal Service
+// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Manual-Approval Withdrawal Service (Atomic D1 Transactions)
 // ============================================================================
 
 import {
@@ -12,36 +12,30 @@ import {
   getCategoryMeta,
 } from '../config.js';
 import {
-  acquireLock,
-  addAllWithdrawalId,
-  addPendingWithdrawalId,
-  addUserWithdrawalId,
-  addVoucherHistory,
-  getCategoryIndex,
-  getPendingWithdrawalIds,
+  countAvailableVouchersByCategory,
+  executeApproveWithdrawalTransaction,
+  executeCreateWithdrawalTransaction,
+  executeRejectWithdrawalTransaction,
   getSettings,
   getUser,
+  getUserActivePendingWithdrawal,
   getWithdrawal,
-  incrementGlobalStats,
-  releaseLock,
-  removePendingWithdrawalId,
   saveUser,
-  saveWithdrawal,
 } from '../database.js';
 import { logAdminActivity } from './activity-log.js';
-import {
-  finalizeApprovedWithdrawalBalance,
-  refundRejectedWithdrawalBalance,
-  reserveWithdrawalBalance,
-} from './balance.js';
 import {
   notifyAdminsNewWithdrawal,
   notifyUserWithdrawalApproved,
   notifyUserWithdrawalRejected,
 } from './notifications.js';
 import {
+  logBotErrorEvent,
+  logWithdrawalApprovedEvent,
+  logWithdrawalRejectedEvent,
+  logWithdrawalRequestedEvent,
+} from './secretary.js';
+import {
   checkAndTriggerLowStockAlert,
-  finalizeVoucherDelivery,
   releaseReservedVoucher,
   reserveAvailableVoucher,
 } from './voucher-service.js';
@@ -62,21 +56,19 @@ export async function validateWithdrawalEligibility(env, user, categoryKey = nul
   const voucherValuePaise = Math.max(100, Number(settings.defaultVoucherValuePaise || 1000));
   const requiredPaise = Math.max(minWithdrawalPaise, voucherValuePaise);
 
-  // Check active pending withdrawal
-  if (user.activePendingWithdrawalId) {
-    const existing = await getWithdrawal(env, user.activePendingWithdrawalId);
-    if (existing && existing.status === 'pending') {
-      return {
-        ok: false,
-        error:
-          `⏳ You already have a pending withdrawal request (<code>${existing.id}</code>).\n\n` +
-          `Please wait for admin review before submitting another request.`,
-      };
-    } else {
-      // Self-heal stale pointer
-      user.activePendingWithdrawalId = null;
-      await saveUser(env, user);
-    }
+  // Check active pending withdrawal in D1 (single source of truth)
+  const existingPending = await getUserActivePendingWithdrawal(env, user.id);
+  if (existingPending) {
+    return {
+      ok: false,
+      error:
+        `⏳ You already have a pending withdrawal request (<code>${existingPending.id}</code>).\n\n` +
+        `Please wait for admin review before submitting another request.`,
+    };
+  } else if (user.activePendingWithdrawalId) {
+    // Self-heal stale pointer if present
+    user.activePendingWithdrawalId = null;
+    await saveUser(env, user);
   }
 
   // Enforce maximum ONE approved withdrawal in 24 hours
@@ -112,8 +104,8 @@ export async function validateWithdrawalEligibility(env, user, categoryKey = nul
     if (!cat) {
       return { ok: false, error: 'Invalid voucher category selected.' };
     }
-    const idx = await getCategoryIndex(env, categoryKey);
-    if (!idx.availableIds.length) {
+    const availableCount = await countAvailableVouchersByCategory(env, categoryKey);
+    if (availableCount <= 0) {
       return {
         ok: false,
         error: `🔴 <b>${cat.name}</b> is currently <b>OUT OF STOCK</b>.\n\nPlease choose another available category or check back soon.`,
@@ -130,108 +122,77 @@ export async function validateWithdrawalEligibility(env, user, categoryKey = nul
 }
 
 /**
- * Create a new manual-approval pending withdrawal request and reserve user balance.
+ * Create a new manual-approval pending withdrawal request and atomically reserve user balance.
+ * Protected by D1 CHECK(balance_paise >= 0), partial UNIQUE index on pending withdrawals,
+ * and immutable ledger entry in a single atomic batch.
  * Never delivers a voucher here!
  */
 export async function createWithdrawalRequest(env, userId, categoryKey) {
   const uid = String(userId);
-  const lockScope = `wd_user:${uid}`;
-  const lockToken = await acquireLock(env, lockScope, 60);
-  if (!lockToken) {
-    return { ok: false, error: '⏳ Your previous withdrawal action is still processing. Please wait.' };
+  const user = await getUser(env, uid);
+  const check = await validateWithdrawalEligibility(env, user, categoryKey);
+  if (!check.ok) {
+    return check;
   }
 
-  try {
-    const user = await getUser(env, uid);
-    const check = await validateWithdrawalEligibility(env, user, categoryKey);
-    if (!check.ok) {
-      return check;
-    }
+  const requestId = generateId('WD');
+  const amountPaise = check.amountPaise;
+  const balanceSnapshotPaise = Number(user.balancePaise || 0);
+  const now = Date.now();
 
-    // Extra safety check against pending list
-    const pendingIds = await getPendingWithdrawalIds(env);
-    for (const pid of pendingIds) {
-      const pw = await getWithdrawal(env, pid);
-      if (pw && String(pw.userId) === uid && pw.status === 'pending') {
-        return {
-          ok: false,
-          error: `⏳ You already have a pending request (<code>${pw.id}</code>).`,
-        };
-      }
-    }
+  const withdrawal = {
+    id: requestId,
+    userId: uid,
+    username: user.username || '',
+    userName: formatUserName(user),
+    amountPaise,
+    category: categoryKey,
+    status: 'pending', // pending | approved | rejected
+    createdAt: now,
+    processedAt: null,
+    processedBy: null,
+    rejectionReason: '',
+    voucherId: null,
+    voucherCode: null,
+    userBalanceSnapshotPaise: balanceSnapshotPaise,
+  };
 
-    const requestId = generateId('WD');
-    const amountPaise = check.amountPaise;
-    const balanceSnapshotPaise = Number(user.balancePaise || 0);
-
-    // Reserve balance safely BEFORE saving withdrawal
-    const reserveRes = await reserveWithdrawalBalance(env, uid, amountPaise, requestId);
-    if (!reserveRes.ok) {
-      return { ok: false, error: reserveRes.error };
-    }
-
-    const now = Date.now();
-    const withdrawal = {
-      id: requestId,
-      userId: uid,
-      username: user.username || '',
-      userName: formatUserName(user),
-      amountPaise,
-      category: categoryKey,
-      status: 'pending', // pending | approved | rejected
-      createdAt: now,
-      processedAt: null,
-      processedBy: null,
-      rejectionReason: '',
-      voucherId: null,
-      voucherCode: null,
-      userBalanceSnapshotPaise: balanceSnapshotPaise,
-    };
-
-    try {
-      await saveWithdrawal(env, withdrawal);
-      await addPendingWithdrawalId(env, requestId);
-      await addAllWithdrawalId(env, requestId);
-      await addUserWithdrawalId(env, uid, requestId);
-    } catch (err) {
-      // Recovery: refund balance if saving request failed
-      await refundRejectedWithdrawalBalance(env, uid, amountPaise, requestId);
-      return {
-        ok: false,
-        error: 'Temporary storage error while creating request. Your balance was not deducted.',
-      };
-    }
-
-    // Notify Owner & Admins immediately
-    await notifyAdminsNewWithdrawal(env, withdrawal);
-
-    return {
-      ok: true,
-      withdrawal,
-      updatedUser: reserveRes.user,
-    };
-  } finally {
-    await releaseLock(env, lockScope, lockToken);
+  const txResult = await executeCreateWithdrawalTransaction(env, withdrawal);
+  if (!txResult.ok) {
+    await logBotErrorEvent(env, {
+      category: 'FINANCIAL_OP_FAILED',
+      summary: `Withdrawal request creation failed: ${txResult.error}`,
+      context: `user=${uid} category=${categoryKey} amountPaise=${amountPaise}`,
+      dedupId: `wd_create_fail:${requestId}`,
+    });
+    return { ok: false, error: txResult.error };
   }
+
+  // Notify Owner & Admins immediately and log to PnA X Logs
+  await notifyAdminsNewWithdrawal(env, withdrawal);
+  await logWithdrawalRequestedEvent(env, { withdrawal });
+
+  return {
+    ok: true,
+    withdrawal,
+    updatedUser: txResult.user,
+  };
 }
 
 /**
- * Admin approval workflow:
- * 1. Lock request & verify pending
- * 2. Re-verify 24-hour approved withdrawal rule
- * 3. Reserve one unused voucher from selected category
- * 4. Finalize voucher delivery & permanent voucher history
- * 5. Complete withdrawal & update user balance
- * 6. Notify user & log admin activity
- * 7. Check & trigger Low Stock Alert if needed
+ * Admin approval workflow (atomic D1 transactions):
+ * 1. Verify pending withdrawal & 24-hour approved withdrawal rule
+ * 2. Atomically reserve one unused voucher via SQL UPDATE ... RETURNING
+ * 3. Execute ONE atomic D1 batch:
+ *    - Mark withdrawal approved (trigger aborts if already processed)
+ *    - Mark voucher delivered
+ *    - Insert permanent voucher_history (UNIQUE voucher_id & withdrawal_request_id)
+ *    - Finalize user balances & 24h cooldown
+ *    - Write financial ledger entry
+ * 4. On any interruption before commit, release reserved voucher cleanly
+ * 5. Log admin activity, DM voucher privately, and check Low Stock Alert
  */
 export async function approveWithdrawalRequest(env, requestId, adminId) {
-  const lockScope = `wd_act:${requestId}`;
-  const lockToken = await acquireLock(env, lockScope, 60);
-  if (!lockToken) {
-    return { ok: false, error: 'This withdrawal request is currently being processed by another admin.' };
-  }
-
   let reservedVoucher = null;
 
   try {
@@ -251,7 +212,7 @@ export async function approveWithdrawalRequest(env, requestId, adminId) {
       return { ok: false, error: 'Associated user account no longer exists.' };
     }
 
-    // Enforce max 1 approved withdrawal in 24h even if an edge case occurred
+    // Enforce max 1 approved withdrawal in 24h
     if (user.lastApprovedWithdrawalAt && Date.now() - Number(user.lastApprovedWithdrawalAt) < DAY_MS) {
       const rem = DAY_MS - (Date.now() - Number(user.lastApprovedWithdrawalAt));
       return {
@@ -260,7 +221,7 @@ export async function approveWithdrawalRequest(env, requestId, adminId) {
       };
     }
 
-    // Reserve one unused voucher
+    // Atomically reserve one unused voucher
     const reserveRes = await reserveAvailableVoucher(
       env,
       withdrawal.category,
@@ -274,153 +235,127 @@ export async function approveWithdrawalRequest(env, requestId, adminId) {
     const remainingStock = reserveRes.remainingStock;
     const now = Date.now();
 
-    // Mark voucher permanently delivered
-    const deliveredVoucher = await finalizeVoucherDelivery(env, reservedVoucher, adminId, now);
-
-    // Record permanent voucher history
-    const historyRecord = {
-      id: generateId('VH'),
-      voucherId: deliveredVoucher.id,
-      code: deliveredVoucher.code,
-      category: deliveredVoucher.category,
-      valuePaise: deliveredVoucher.valuePaise,
-      userId: withdrawal.userId,
-      username: withdrawal.username || user.username || '',
-      userName: withdrawal.userName || formatUserName(user),
-      withdrawalRequestId: withdrawal.id,
-      approvedBy: String(adminId),
-      deliveredAt: now,
-    };
-    await addVoucherHistory(env, historyRecord);
-
-    // Update withdrawal record
-    withdrawal.status = 'approved';
-    withdrawal.processedAt = now;
-    withdrawal.processedBy = String(adminId);
-    withdrawal.voucherId = deliveredVoucher.id;
-    withdrawal.voucherCode = deliveredVoucher.code;
-    await saveWithdrawal(env, withdrawal);
-    await removePendingWithdrawalId(env, withdrawal.id);
-
-    // Update user balances & cooldown
-    await finalizeApprovedWithdrawalBalance(
-      env,
-      withdrawal.userId,
-      withdrawal.amountPaise,
-      withdrawal.id,
-      now
-    );
-
-    // Update global statistics
-    await incrementGlobalStats(env, {
-      totalApprovedWithdrawals: 1,
-      totalWithdrawnPaise: withdrawal.amountPaise,
-      totalVouchersDelivered: 1,
+    const txRes = await executeApproveWithdrawalTransaction(env, {
+      withdrawal,
+      voucher: reservedVoucher,
+      adminId,
+      processedAt: now,
     });
 
-    // Record admin activity log
+    if (!txRes.ok) {
+      // Withdrawal was concurrently processed -> release reserved voucher immediately
+      await releaseReservedVoucher(env, reservedVoucher);
+      reservedVoucher = null;
+      return { ok: false, error: txRes.error };
+    }
+
+    // Committed successfully -> do not roll back voucher
+    const deliveredVoucher = txRes.voucher;
+    const approvedWithdrawal = txRes.withdrawal;
+    reservedVoucher = null;
+
+    // Record admin activity log & Secretary Mode log (voucher ID only, never raw redeem code)
     await logAdminActivity(
       env,
       adminId,
       ACTIVITY_ACTIONS.WITHDRAWAL_APPROVED,
-      `Approved ${withdrawal.id} for user ${withdrawal.userId} (${formatINR(withdrawal.amountPaise)}, ${withdrawal.category}, voucher ${deliveredVoucher.id})`
+      `Approved ${approvedWithdrawal.id} for user ${approvedWithdrawal.userId} (${formatINR(approvedWithdrawal.amountPaise)}, ${approvedWithdrawal.category}, voucher ${deliveredVoucher.id})`
     );
+    await logWithdrawalApprovedEvent(env, {
+      withdrawal: approvedWithdrawal,
+      voucher: deliveredVoucher,
+      adminId,
+    });
 
     // Deliver voucher privately to user
-    const dmRes = await notifyUserWithdrawalApproved(env, withdrawal, deliveredVoucher);
+    const dmRes = await notifyUserWithdrawalApproved(env, approvedWithdrawal, deliveredVoucher);
 
     // Check low stock threshold & alert admins if triggered
-    await checkAndTriggerLowStockAlert(env, withdrawal.category, remainingStock);
+    await checkAndTriggerLowStockAlert(env, approvedWithdrawal.category, remainingStock);
 
     return {
       ok: true,
-      withdrawal,
+      withdrawal: approvedWithdrawal,
       voucher: deliveredVoucher,
       remainingStock,
       dmDelivered: dmRes.ok,
       dmError: dmRes.ok ? '' : dmRes.description,
     };
   } catch (err) {
-    // Recovery if failure happened before withdrawal was marked approved
     if (reservedVoucher) {
       await releaseReservedVoucher(env, reservedVoucher);
     }
+    await logBotErrorEvent(env, {
+      category: 'FINANCIAL_OP_FAILED',
+      summary: `Withdrawal approval interrupted: ${err?.message || 'Unknown error'}`,
+      context: `requestId=${requestId} adminId=${adminId}`,
+      dedupId: `wd_app_fail:${requestId}:${Date.now()}`,
+    });
     return {
       ok: false,
       error: `Approval interrupted safely: ${err?.message || 'Unknown error'}`,
     };
-  } finally {
-    await releaseLock(env, lockScope, lockToken);
   }
 }
 
 /**
- * Admin rejection workflow:
- * 1. Verify pending status under lock
- * 2. Mark request rejected with optional reason
- * 3. Refund reserved balance cleanly back to user's available balance
- * 4. Update stats, log admin action, and notify user
+ * Admin rejection workflow (atomic D1 transaction):
+ * 1. Verify pending status
+ * 2. Execute ONE atomic D1 batch:
+ *    - Mark request rejected with optional reason (trigger aborts if already processed)
+ *    - Refund 100% of reserved balance cleanly back to user's available balance
+ *    - Write immutable ledger refund entry
+ * 3. Log admin action and notify user
  */
 export async function rejectWithdrawalRequest(env, requestId, adminId, reason = '') {
-  const lockScope = `wd_act:${requestId}`;
-  const lockToken = await acquireLock(env, lockScope, 60);
-  if (!lockToken) {
-    return { ok: false, error: 'This withdrawal request is currently being processed.' };
+  const withdrawal = await getWithdrawal(env, requestId);
+  if (!withdrawal) {
+    return { ok: false, error: 'Withdrawal request not found.' };
   }
-
-  try {
-    const withdrawal = await getWithdrawal(env, requestId);
-    if (!withdrawal) {
-      return { ok: false, error: 'Withdrawal request not found.' };
-    }
-    if (withdrawal.status !== 'pending') {
-      return {
-        ok: false,
-        error: `Request ${requestId} has already been ${withdrawal.status.toUpperCase()}.`,
-      };
-    }
-
-    const now = Date.now();
-    const cleanReason = String(reason || '').trim().slice(0, 250);
-
-    withdrawal.status = 'rejected';
-    withdrawal.processedAt = now;
-    withdrawal.processedBy = String(adminId);
-    withdrawal.rejectionReason = cleanReason;
-
-    await saveWithdrawal(env, withdrawal);
-    await removePendingWithdrawalId(env, withdrawal.id);
-
-    const refundedUser = await refundRejectedWithdrawalBalance(
-      env,
-      withdrawal.userId,
-      withdrawal.amountPaise,
-      withdrawal.id
-    );
-
-    await incrementGlobalStats(env, {
-      totalRejectedWithdrawals: 1,
-    });
-
-    await logAdminActivity(
-      env,
-      adminId,
-      ACTIVITY_ACTIONS.WITHDRAWAL_REJECTED,
-      `Rejected ${withdrawal.id} for user ${withdrawal.userId} (${formatINR(withdrawal.amountPaise)} refunded)${cleanReason ? ` — Reason: ${cleanReason}` : ''}`
-    );
-
-    await notifyUserWithdrawalRejected(
-      env,
-      withdrawal,
-      refundedUser ? refundedUser.balancePaise : withdrawal.amountPaise
-    );
-
+  if (withdrawal.status !== 'pending') {
     return {
-      ok: true,
-      withdrawal,
-      refundedBalancePaise: refundedUser ? refundedUser.balancePaise : 0,
+      ok: false,
+      error: `Request ${requestId} has already been ${withdrawal.status.toUpperCase()}.`,
     };
-  } finally {
-    await releaseLock(env, lockScope, lockToken);
   }
+
+  const now = Date.now();
+  const cleanReason = String(reason || '').trim().slice(0, 250);
+
+  const txRes = await executeRejectWithdrawalTransaction(env, {
+    withdrawal,
+    adminId,
+    reason: cleanReason,
+    processedAt: now,
+  });
+
+  if (!txRes.ok) {
+    return { ok: false, error: txRes.error };
+  }
+
+  const rejectedWithdrawal = txRes.withdrawal;
+  const refundedUser = txRes.user;
+
+  await logAdminActivity(
+    env,
+    adminId,
+    ACTIVITY_ACTIONS.WITHDRAWAL_REJECTED,
+    `Rejected ${rejectedWithdrawal.id} for user ${rejectedWithdrawal.userId} (${formatINR(rejectedWithdrawal.amountPaise)} refunded)${cleanReason ? ` — Reason: ${cleanReason}` : ''}`
+  );
+  await logWithdrawalRejectedEvent(env, {
+    withdrawal: rejectedWithdrawal,
+    adminId,
+  });
+
+  await notifyUserWithdrawalRejected(
+    env,
+    rejectedWithdrawal,
+    refundedUser ? refundedUser.balancePaise : rejectedWithdrawal.amountPaise
+  );
+
+  return {
+    ok: true,
+    withdrawal: rejectedWithdrawal,
+    refundedBalancePaise: refundedUser ? refundedUser.balancePaise : 0,
+  };
 }

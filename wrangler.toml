@@ -1,10 +1,8 @@
 # ============================================================================
-# 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Cloudflare Workers Configuration
+# 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Cloudflare Workers + D1 Configuration
 # ============================================================================
-# 1. Create KV namespace:
-#      npx wrangler kv namespace create DB
-#    Copy the returned `id` below (and optionally create a preview namespace
-#    with `npx wrangler kv namespace create DB --preview`).
+# 1. Apply D1 SQL migrations BEFORE deploying:
+#      npx wrangler d1 migrations apply pna-rewards-db --remote
 #
 # 2. Set Worker secrets (NEVER put secrets in this file):
 #      npx wrangler secret put BOT_TOKEN
@@ -12,6 +10,9 @@
 #
 # 3. Deploy:
 #      npx wrangler deploy
+#
+# NOTE: Previous KV namespace is intentionally untouched in Cloudflare as a
+#       read-only backup and is no longer bound to this Worker.
 # ============================================================================
 
 name = "pna-rewards-bot"
@@ -19,15 +20,20 @@ main = "src/index.js"
 compatibility_date = "2025-01-01"
 workers_dev = true
 
-[[kv_namespaces]]
+[[d1_databases]]
 binding = "DB"
-id = "ef7469b6be4048849dc075ee23c10c5a"
-preview_id = "ef7469b6be4048849dc075ee23c10c5a"
+database_name = "pna-rewards-db"
+database_id = "058b6c52-f03c-4520-89c7-b04432bfb974"
+migrations_dir = "migrations"
 
 [vars]
 OWNER_ID = "8838351233"
 SUPPORT_USERNAME = "@Pritam_power"
 UPDATE_CHANNEL_URL = "https://t.me/pnarewards"
+# Secretary Mode (PnA X Logs) target channel:
+# Public channel https://t.me/pnarewards uses "@pnarewards" (auto-resolves numeric ID when bot is admin).
+# If switching to a private channel, set its numeric ID (e.g. "-1001234567890") after making the bot admin.
+PNA_LOG_CHANNEL_ID = "@pnarewards"
 TIMEZONE = "Asia/Kolkata"
 WEBHOOK_PATH = "/webhook"
 # Optional: set BOT_USERNAME (without @) to avoid an extra getMe lookup on cold start

@@ -14,10 +14,10 @@ import {
 } from '../config.js';
 import {
   clearUserState,
+  countAvailableVouchersByCategory,
   getAllCategoryStockSummary,
-  getCategoryIndex,
+  getAvailableVouchersByCategory,
   getSettings,
-  getVoucher,
   getVoucherHistoryPage,
   hasAdminPermission,
   setUserState,
@@ -224,11 +224,7 @@ export async function handleAdminDisableVoucherList(env, callbackQuery, category
 
   await answerCallbackQuery(env, callbackQuery.id);
   const cat = getCategoryMeta(categoryKey);
-  const idx = await getCategoryIndex(env, categoryKey);
-  const slice = idx.availableIds.slice(0, 10);
-  const vouchers = (await Promise.all(slice.map((id) => getVoucher(env, id)))).filter(
-    (v) => v && v.status === 'available'
-  );
+  const vouchers = await getAvailableVouchersByCategory(env, categoryKey, 10);
 
   let text = `${buildHeader('🗑️', `AVAILABLE ${cat.shortName.toUpperCase()} VOUCHERS`)}\n`;
   const rows = [];
@@ -401,11 +397,11 @@ export async function handleAdminLowStockInput(env, message, state) {
   }
 
   const cat = getCategoryMeta(state.category);
-  const idx = await getCategoryIndex(env, state.category);
+  const availableCount = await countAvailableVouchersByCategory(env, state.category);
   const patch = {
     lowStockThresholds: { [state.category]: num },
   };
-  if (idx.availableIds.length > num) {
+  if (availableCount > num) {
     patch.lowStockAlertSent = { [state.category]: false };
   }
 

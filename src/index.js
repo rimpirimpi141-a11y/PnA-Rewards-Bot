@@ -4,6 +4,7 @@
 
 import { ADMIN_BUTTONS, BOT_BRAND, MENU_BUTTONS, getWebhookPath } from './config.js';
 import {
+  checkDatabaseConnection,
   claimUpdateId,
   clearPendingJoinRequest,
   clearUserState,
@@ -12,7 +13,8 @@ import {
   getUserState,
   isAdmin,
   markUserBlocked,
-  saveUser,
+  updateUserForceJoinVerified,
+  updateUserStatus,
 } from './database.js';
 import {
   handleAdminActivityLogs,
@@ -25,6 +27,7 @@ import {
   handleAdminStateInput,
   handleAdminUsersList,
 } from './handlers/admin.js';
+import { handleAdminManageBalanceStart } from './handlers/balance-admin.js';
 import {
   handleDailyBonusClaimCallback,
   handleDailyBonusHistoryCallback,
@@ -33,6 +36,7 @@ import {
 import { handleAdminBroadcastStart } from './handlers/broadcast.js';
 import { handleAdminForceChannelsMenu } from './handlers/forcejoin.js';
 import { handleReferralListView, handleReferralView } from './handlers/referral.js';
+import { handleAdminSecretaryMenu } from './handlers/secretary.js';
 import {
   ensureUserAccess,
   handleStartCommand,
@@ -46,6 +50,7 @@ import {
   handleSupportView,
   handleUpdateChannelView,
   handleUserHistoryView,
+  handleUserLedgerView,
 } from './handlers/user.js';
 import {
   handleAdminAddVoucherMenu,
@@ -64,6 +69,7 @@ import {
   isActiveChannelMember,
   matchesConfiguredChannel,
 } from './services/membership.js';
+import { logBotErrorEvent } from './services/secretary.js';
 import {
   answerCallbackQuery,
   sendMessage,
@@ -92,9 +98,7 @@ async function handleMyChatMemberUpdate(env, update) {
   } else if (newStatus === 'member') {
     const user = await getUser(env, userId);
     if (user && user.status === 'blocked_bot') {
-      user.status = 'active';
-      user.lastActiveAt = Date.now();
-      await saveUser(env, user);
+      await updateUserStatus(env, userId, 'active');
     }
   }
 }
@@ -131,8 +135,7 @@ async function handleChatMemberUpdate(env, update) {
 
   const user = await getUser(env, targetUserId);
   if (user && user.forceJoinVerified) {
-    user.forceJoinVerified = false;
-    await saveUser(env, user);
+    await updateUserForceJoinVerified(env, targetUserId, false);
   }
 }
 
@@ -206,6 +209,12 @@ async function handleCallbackQuery(env, callbackQuery, ctx) {
   if (data === 'usr:history') {
     await answerCallbackQuery(env, callbackQuery.id);
     await handleUserHistoryView(env, tgUser, chatId, msgId);
+    return;
+  }
+
+  if (data === 'usr:ledger') {
+    await answerCallbackQuery(env, callbackQuery.id);
+    await handleUserLedgerView(env, tgUser, chatId, msgId);
     return;
   }
 
@@ -300,6 +309,12 @@ async function tryHandleAdminReplyButton(env, tgUser, chatId, text) {
       return true;
     case ADMIN_BUTTONS.ACTIVITY_LOGS:
       await handleAdminActivityLogs(env, userId, chatId, 1);
+      return true;
+    case ADMIN_BUTTONS.MANAGE_BALANCE:
+      await handleAdminManageBalanceStart(env, userId, chatId);
+      return true;
+    case ADMIN_BUTTONS.SECRETARY_MODE:
+      await handleAdminSecretaryMenu(env, userId, chatId);
       return true;
     default:
       return false;
@@ -462,6 +477,16 @@ async function processTelegramUpdate(env, update, ctx) {
     }
   } catch (err) {
     console.error('Telegram update processing error:', err?.message || String(err));
+    try {
+      await logBotErrorEvent(env, {
+        category: 'BOT_ERROR',
+        summary: err?.message || String(err),
+        context: `update_id=${update?.update_id ?? 'unknown'}`,
+        dedupId: `bot_err:${update?.update_id ?? Date.now()}`,
+      });
+    } catch {
+      // Never allow error logging to throw
+    }
   }
 }
 
@@ -470,14 +495,24 @@ export default {
     const url = new URL(request.url);
     const webhookPath = getWebhookPath(env);
 
-    // Lightweight non-sensitive health endpoint
+    // Lightweight non-sensitive health endpoint with live D1 connectivity check
     if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
-      return jsonResponse({
-        ok: true,
-        service: BOT_BRAND,
-        runtime: 'cloudflare-workers',
-        storage: 'cloudflare-kv',
-      });
+      let dbConnected = false;
+      try {
+        dbConnected = await checkDatabaseConnection(env);
+      } catch {
+        dbConnected = false;
+      }
+      return jsonResponse(
+        {
+          ok: dbConnected,
+          service: BOT_BRAND,
+          runtime: 'cloudflare-workers',
+          storage: 'cloudflare-d1',
+          database: dbConnected ? 'connected' : 'error',
+        },
+        dbConnected ? 200 : 503
+      );
     }
 
     // Telegram Webhook endpoint

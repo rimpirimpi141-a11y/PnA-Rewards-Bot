@@ -23,7 +23,7 @@ import {
   supportInlineKeyboard,
   updateChannelInlineKeyboard,
 } from '../keyboards.js';
-import { getBalanceSummary } from '../services/balance.js';
+import { getBalanceSummary, getUserLedgerEntries } from '../services/balance.js';
 import { editOrSend, sendMessage } from '../telegram.js';
 import { ensureUserAccess } from './start.js';
 
@@ -131,6 +131,59 @@ export async function handleUserHistoryView(env, tgUser, chatId, messageId = nul
   await editOrSend(env, chatId, messageId, text, {
     reply_markup: {
       inline_keyboard: [[{ text: '👤 Back to Profile', callback_data: 'usr:profile' }]],
+    },
+  });
+}
+
+const LEDGER_LABELS = {
+  referral_bonus: '👥 Referral Reward',
+  daily_bonus: '🎁 Daily Bonus',
+  task_reward: '📌 Task Reward',
+  withdrawal_reserve: '⏳ Withdrawal Reserved',
+  withdrawal_approved: '✅ Withdrawal Approved',
+  withdrawal_refund: '♻️ Withdrawal Refund',
+  admin_balance_add: '➕ Admin Balance Credit',
+  admin_balance_deduct: '➖ Admin Balance Deduction',
+  admin_adjustment: '⚙️ Admin Adjustment',
+};
+
+/**
+ * 📜 User's Immutable Wallet Transaction History (`usr:ledger`)
+ * Displays all balance movements including manual admin credits/deductions & reasons.
+ */
+export async function handleUserLedgerView(env, tgUser, chatId, messageId = null) {
+  const access = await ensureUserAccess(env, tgUser, chatId);
+  if (!access.allowed) return;
+
+  const entries = await getUserLedgerEntries(env, access.user.id, 15);
+  let text =
+    `${buildHeader('📜', 'TRANSACTION HISTORY')}\n` +
+    `🏦 <b>Current Balance:</b> <b>${formatINR(access.user.balancePaise)}</b>\n` +
+    `${DIVIDER}\n`;
+
+  if (!entries.length) {
+    text += `<i>No wallet transactions recorded yet.</i>`;
+  } else {
+    for (const e of entries) {
+      const label = LEDGER_LABELS[e.entryType] || e.entryType;
+      const sign =
+        e.direction === 'credit' ? '+' : e.direction === 'debit' ? '-' : '• ';
+      const descLine = e.description ? `\n  📝 <i>${escapeHtml(e.description)}</i>` : '';
+      text +=
+        `• <b>${label}</b> — <b>${sign}${formatINR(e.amountPaise)}</b>\n` +
+        `  🏦 Balance: ${formatINR(e.balanceBeforePaise)} → <b>${formatINR(e.balanceAfterPaise)}</b>${descLine}\n` +
+        `  🆔 <code>${escapeHtml(e.referenceId)}</code> • <i>${formatIST(e.createdAt, env)}</i>\n\n`;
+    }
+  }
+
+  await editOrSend(env, chatId, messageId, text, {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '💰 Back to Balance', callback_data: 'usr:balance' },
+          { text: '👤 My Profile', callback_data: 'usr:profile' },
+        ],
+      ],
     },
   });
 }

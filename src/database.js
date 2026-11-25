@@ -1,157 +1,328 @@
 // ============================================================================
-// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Cloudflare Workers KV Storage Layer (env.DB ONLY)
+// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Cloudflare D1 SQLite Storage Layer (env.DB ONLY)
 // ============================================================================
-// Logical collections mapped cleanly to KV key prefixes:
-//   settings:global               -> Global configurable bot settings
-//   user:<telegramId>             -> User profile, balances, referrals, status
-//   users:index                   -> Ordered array of registered user IDs
-//   state:<telegramId>            -> Short-lived user/admin conversation state
-//   ref_claim:<referredId>        -> Idempotency record (1 referral per account)
-//   referrals:<referrerId>        -> Array of referrals earned by referrer
-//   daily_claims:<telegramId>     -> User daily bonus claim history
-//   voucher:<voucherId>           -> Individual voucher record
-//   vcode:<hash>                  -> Global duplicate voucher protection index
-//   vouchers:cat:<category>       -> Per-category voucher ID index
-//   vhist:<historyId>             -> Permanent delivered voucher record
-//   voucher_history:index         -> Global delivered voucher ID list
-//   user_vhist:<telegramId>       -> Per-user delivered voucher ID list
-//   withdrawal:<requestId>        -> Withdrawal request record
-//   withdrawals:pending           -> Pending withdrawal IDs
-//   withdrawals:all               -> All withdrawal IDs (newest first)
-//   user_withdrawals:<telegramId> -> Per-user withdrawal IDs
-//   admins:list                   -> Authorized admin map (excluding owner)
-//   force_channels:list           -> Configured force-join channels
-//   activity_logs:list            -> Admin activity log records
-//   broadcast:<broadcastId>       -> Broadcast job metadata & delivery stats
-//   stats:global                  -> Global counters
-//   upd:<updateId>                -> Short-TTL Telegram update deduplication
-//   lock:<scope>                  -> Short-TTL KV reservation lock
-//   meta:bot_username             -> Cached Telegram bot username
+// Single source of truth on Cloudflare D1 (`binding = "DB"`).
+// All SQL statements use parameterized prepared statements and atomic batches.
+// Monetary values are strictly INTEGER paise; Telegram IDs are TEXT.
 // ============================================================================
 
 import {
   ACTIVE_WINDOW_MS,
   DEFAULT_ADMIN_PERMISSIONS,
   DEFAULT_SETTINGS,
+  MAX_MANUAL_BALANCE_ADJUSTMENT_PAISE,
   OWNER_PERMISSIONS,
   VOUCHER_CATEGORY_LIST,
+  generateId,
+  getConfiguredLogChannelId,
   getOwnerId,
   normalizeVoucherCode,
 } from './config.js';
 
-function assertKV(env) {
-  if (!env?.DB) {
-    throw new Error('Cloudflare KV namespace binding "DB" is not configured.');
+function assertDB(env) {
+  if (!env?.DB || typeof env.DB.prepare !== 'function') {
+    throw new Error(
+      'Cloudflare D1 database binding "DB" is not configured. Ensure [[d1_databases]] binding = "DB" is set in wrangler.toml.'
+    );
   }
   return env.DB;
 }
 
-export async function kvGetJson(env, key, fallback = null) {
-  const kv = assertKV(env);
+function safeJsonParse(raw, fallback) {
+  if (raw === null || raw === undefined || raw === '') return fallback;
   try {
-    const raw = await kv.get(key, 'json');
-    return raw === null || raw === undefined ? fallback : raw;
+    return JSON.parse(raw);
   } catch {
     return fallback;
   }
 }
 
-export async function kvPutJson(env, key, value, options = undefined) {
-  const kv = assertKV(env);
-  await kv.put(key, JSON.stringify(value), options);
+function toInt(val, fallback = 0) {
+  const n = Number(val);
+  return Number.isFinite(n) ? Math.round(n) : fallback;
 }
 
-export async function kvDelete(env, key) {
-  const kv = assertKV(env);
-  await kv.delete(key);
+function toNonNegInt(val) {
+  return Math.max(0, toInt(val, 0));
+}
+
+function mapUserRow(row) {
+  if (!row) return null;
+  return {
+    id: String(row.telegram_id),
+    firstName: row.first_name || '',
+    lastName: row.last_name || '',
+    username: row.username || '',
+    joinedAt: toInt(row.joined_at),
+    lastActiveAt: toInt(row.last_active_at),
+    status: row.status || 'active',
+    balancePaise: toNonNegInt(row.balance_paise),
+    totalEarnedPaise: toNonNegInt(row.total_earned_paise),
+    referralEarningsPaise: toNonNegInt(row.referral_earnings_paise),
+    dailyBonusEarningsPaise: toNonNegInt(row.daily_bonus_earnings_paise),
+    totalWithdrawnPaise: toNonNegInt(row.total_withdrawn_paise),
+    pendingWithdrawalPaise: toNonNegInt(row.pending_withdrawal_paise),
+    totalReferrals: toNonNegInt(row.total_referrals),
+    referredBy: row.referred_by ? String(row.referred_by) : null,
+    pendingReferrerId: row.pending_referrer_id ? String(row.pending_referrer_id) : null,
+    referralCredited: Boolean(row.referral_credited),
+    lastDailyClaimAt:
+      row.last_daily_claim_at !== null && row.last_daily_claim_at !== undefined
+        ? toInt(row.last_daily_claim_at)
+        : null,
+    dailyBonusCount: toNonNegInt(row.daily_bonus_count),
+    lastApprovedWithdrawalAt:
+      row.last_approved_withdrawal_at !== null && row.last_approved_withdrawal_at !== undefined
+        ? toInt(row.last_approved_withdrawal_at)
+        : null,
+    activePendingWithdrawalId: row.active_pending_withdrawal_id || null,
+    forceJoinVerified: Boolean(row.force_join_verified),
+    withdrawalCount: toNonNegInt(row.withdrawal_count),
+  };
+}
+
+function mapVoucherRow(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    code: String(row.code),
+    normalizedCode: String(row.normalized_code),
+    category: String(row.category),
+    valuePaise: toNonNegInt(row.value_paise),
+    status: String(row.status),
+    addedAt: toInt(row.added_at),
+    addedBy: String(row.added_by),
+    assignedUserId: row.assigned_user_id ? String(row.assigned_user_id) : null,
+    withdrawalRequestId: row.withdrawal_request_id || null,
+    approvedBy: row.approved_by ? String(row.approved_by) : null,
+    deliveredAt:
+      row.delivered_at !== null && row.delivered_at !== undefined ? toInt(row.delivered_at) : null,
+    disabledAt:
+      row.disabled_at !== null && row.disabled_at !== undefined ? toInt(row.disabled_at) : null,
+    disabledBy: row.disabled_by ? String(row.disabled_by) : null,
+  };
+}
+
+function mapVoucherHistoryRow(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    voucherId: String(row.voucher_id),
+    code: String(row.code),
+    category: String(row.category),
+    valuePaise: toNonNegInt(row.value_paise),
+    userId: String(row.user_id),
+    username: row.username || '',
+    userName: row.user_name || '',
+    withdrawalRequestId: String(row.withdrawal_request_id),
+    approvedBy: String(row.approved_by),
+    deliveredAt: toInt(row.delivered_at),
+  };
+}
+
+function mapWithdrawalRow(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    userId: String(row.user_id),
+    username: row.username || '',
+    userName: row.user_name || '',
+    amountPaise: toNonNegInt(row.amount_paise),
+    category: String(row.category),
+    status: String(row.status),
+    createdAt: toInt(row.created_at),
+    processedAt:
+      row.processed_at !== null && row.processed_at !== undefined ? toInt(row.processed_at) : null,
+    processedBy: row.processed_by ? String(row.processed_by) : null,
+    rejectionReason: row.rejection_reason || '',
+    voucherId: row.voucher_id || null,
+    voucherCode: row.voucher_code || null,
+    userBalanceSnapshotPaise: toNonNegInt(row.user_balance_snapshot_paise),
+  };
+}
+
+function mapForceChannelRow(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    chatId: String(row.chat_id),
+    username: row.username || '',
+    title: row.title || String(row.chat_id),
+    inviteLink: row.invite_link || '',
+    isPrivate: Boolean(row.is_private),
+    isRequestToJoin: Boolean(row.is_request_to_join),
+    addedBy: row.added_by || '',
+    addedAt: toInt(row.added_at),
+  };
+}
+
+function mapBroadcastRow(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    adminId: String(row.admin_id),
+    sourceChatId: String(row.source_chat_id),
+    sourceMessageId: toInt(row.source_message_id),
+    mediaType: String(row.media_type),
+    previewSummary: row.preview_summary || '',
+    totalRecipients: toNonNegInt(row.total_recipients),
+    skippedBlocked: toNonNegInt(row.skipped_blocked),
+    sentCount: toNonNegInt(row.sent_count),
+    failedCount: toNonNegInt(row.failed_count),
+    newlyBlockedCount: toNonNegInt(row.newly_blocked_count),
+    status: String(row.status),
+    createdAt: toInt(row.created_at),
+    completedAt:
+      row.completed_at !== null && row.completed_at !== undefined ? toInt(row.completed_at) : null,
+  };
+}
+
+function mapActivityLogRow(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    adminId: String(row.admin_id),
+    action: String(row.action),
+    details: row.details || '',
+    timestamp: toInt(row.created_at),
+  };
+}
+
+function mapLedgerRow(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    userId: String(row.user_id),
+    entryType: String(row.entry_type),
+    direction: String(row.direction),
+    amountPaise: toNonNegInt(row.amount_paise),
+    balanceBeforePaise: toNonNegInt(row.balance_before_paise),
+    balanceAfterPaise: toNonNegInt(row.balance_after_paise),
+    referenceType: String(row.reference_type),
+    referenceId: String(row.reference_id),
+    description: row.description || '',
+    createdAt: toInt(row.created_at),
+  };
 }
 
 // ----------------------------------------------------------------------------
-// Idempotency & KV-Compatible Reservation Locks
+// D1 Connectivity Health Check
+// ----------------------------------------------------------------------------
+
+export async function checkDatabaseConnection(env) {
+  const db = assertDB(env);
+  const row = await db.prepare('SELECT 1 AS ok').first();
+  return Boolean(row && Number(row.ok) === 1);
+}
+
+// ----------------------------------------------------------------------------
+// Telegram Update Deduplication (`processed_updates`)
 // ----------------------------------------------------------------------------
 
 /**
- * Prevent duplicate processing when Telegram retries webhook delivery.
- * Note: KV is eventually consistent; this provides practical webhook dedup.
+ * Atomically claim a Telegram update_id using PRIMARY KEY uniqueness.
+ * Returns true if newly claimed, false if already processed.
  */
 export async function claimUpdateId(env, updateId) {
   if (updateId === undefined || updateId === null) return true;
-  const key = `upd:${updateId}`;
-  const existing = await assertKV(env).get(key);
-  if (existing) return false;
-  await assertKV(env).put(key, '1', { expirationTtl: 300 });
+  const db = assertDB(env);
+  const id = String(updateId);
+  const now = Date.now();
+  const expiresAt = now + 5 * 60 * 1000;
+
+  const res = await db
+    .prepare(
+      `INSERT OR IGNORE INTO processed_updates (update_id, processed_at, expires_at)
+       VALUES (?, ?, ?)`
+    )
+    .bind(id, now, expiresAt)
+    .run();
+
+  const changes = Number(res?.meta?.changes ?? 0);
+  if (changes === 0) return false;
+
+  // Opportunistic lightweight cleanup of expired update IDs (~1 in 25 updates)
+  if (Number(updateId) % 25 === 0) {
+    await db
+      .prepare('DELETE FROM processed_updates WHERE expires_at < ?')
+      .bind(now)
+      .run()
+      .catch(() => {});
+  }
+
   return true;
 }
 
-/**
- * Best-effort KV reservation lock with token verification.
- * Because Cloudflare KV does not support atomic CAS, we write a unique token
- * and verify ownership after write before proceeding with critical mutations.
- */
-export async function acquireLock(env, scope, ttlSeconds = 60) {
-  const key = `lock:${scope}`;
-  const existing = await kvGetJson(env, key, null);
-  const now = Date.now();
-  if (existing && existing.expiresAt > now) {
-    return null;
-  }
-
-  const token = crypto.randomUUID();
-  const record = { token, createdAt: now, expiresAt: now + ttlSeconds * 1000 };
-  await kvPutJson(env, key, record, { expirationTtl: Math.max(60, ttlSeconds) });
-
-  const verify = await kvGetJson(env, key, null);
-  if (!verify || verify.token !== token) {
-    return null;
-  }
-  return token;
-}
-
-export async function releaseLock(env, scope, token) {
-  const key = `lock:${scope}`;
-  const existing = await kvGetJson(env, key, null);
-  if (existing && existing.token === token) {
-    await kvDelete(env, key);
-  }
-}
-
 // ----------------------------------------------------------------------------
-// Cached Bot Metadata
+// Cached Bot Metadata (Stored in `settings` table)
 // ----------------------------------------------------------------------------
 
 export async function getCachedBotUsername(env) {
   if (env?.BOT_USERNAME && String(env.BOT_USERNAME).trim()) {
     return String(env.BOT_USERNAME).trim().replace(/^@/, '');
   }
-  const cached = await assertKV(env).get('meta:bot_username');
-  return cached ? cached.replace(/^@/, '') : '';
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT value_json, updated_at FROM settings WHERE key = ?')
+    .bind('bot_username')
+    .first();
+  if (!row) return '';
+  if (Date.now() - toInt(row.updated_at) > 24 * 60 * 60 * 1000) return '';
+  const val = safeJsonParse(row.value_json, '');
+  return val ? String(val).replace(/^@/, '') : '';
 }
 
 export async function setCachedBotUsername(env, username) {
   if (!username) return;
-  await assertKV(env).put('meta:bot_username', String(username).replace(/^@/, ''), {
-    expirationTtl: 86400,
-  });
+  const db = assertDB(env);
+  const clean = String(username).replace(/^@/, '');
+  await db
+    .prepare(
+      `INSERT INTO settings (key, value_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`
+    )
+    .bind('bot_username', JSON.stringify(clean), Date.now())
+    .run();
 }
 
 export async function getCachedBotId(env) {
-  const cached = await assertKV(env).get('meta:bot_id');
-  return cached ? String(cached).trim() : '';
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT value_json, updated_at FROM settings WHERE key = ?')
+    .bind('bot_id')
+    .first();
+  if (!row) return '';
+  if (Date.now() - toInt(row.updated_at) > 24 * 60 * 60 * 1000) return '';
+  const val = safeJsonParse(row.value_json, '');
+  return val ? String(val).trim() : '';
 }
 
 export async function setCachedBotId(env, botId) {
   if (!botId) return;
-  await assertKV(env).put('meta:bot_id', String(botId).trim(), {
-    expirationTtl: 86400,
-  });
+  const db = assertDB(env);
+  await db
+    .prepare(
+      `INSERT INTO settings (key, value_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`
+    )
+    .bind('bot_id', JSON.stringify(String(botId).trim()), Date.now())
+    .run();
 }
 
 // ----------------------------------------------------------------------------
-// Global Settings
+// Global Settings (`settings` table)
 // ----------------------------------------------------------------------------
 
 export async function getSettings(env) {
-  const stored = await kvGetJson(env, 'settings:global', null);
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT value_json FROM settings WHERE key = ?')
+    .bind('global')
+    .first();
+
+  const stored = row ? safeJsonParse(row.value_json, null) : null;
   const envSupport = env?.SUPPORT_USERNAME || DEFAULT_SETTINGS.supportUsername;
   const envChannel = env?.UPDATE_CHANNEL_URL || DEFAULT_SETTINGS.updateChannelUrl;
 
@@ -182,11 +353,20 @@ export async function getSettings(env) {
 }
 
 export async function saveSettings(env, settings) {
+  const db = assertDB(env);
+  const now = Date.now();
   const payload = {
     ...settings,
-    updatedAt: Date.now(),
+    updatedAt: now,
   };
-  await kvPutJson(env, 'settings:global', payload);
+  await db
+    .prepare(
+      `INSERT INTO settings (key, value_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`
+    )
+    .bind('global', JSON.stringify(payload), now)
+    .run();
   return payload;
 }
 
@@ -208,118 +388,256 @@ export async function updateSettings(env, patch) {
 }
 
 // ----------------------------------------------------------------------------
-// Users Collection
+// Users Collection (`users` table)
 // ----------------------------------------------------------------------------
 
 export async function getUser(env, telegramId) {
   if (!telegramId) return null;
-  return kvGetJson(env, `user:${String(telegramId)}`, null);
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT * FROM users WHERE telegram_id = ?')
+    .bind(String(telegramId))
+    .first();
+  return mapUserRow(row);
 }
 
 export async function saveUser(env, user) {
   if (!user?.id) throw new Error('Cannot save user without id');
+  const db = assertDB(env);
+  const now = Date.now();
   const normalized = {
-    ...user,
     id: String(user.id),
-    balancePaise: Math.max(0, Math.round(Number(user.balancePaise || 0))),
-    totalEarnedPaise: Math.max(0, Math.round(Number(user.totalEarnedPaise || 0))),
-    referralEarningsPaise: Math.max(0, Math.round(Number(user.referralEarningsPaise || 0))),
-    dailyBonusEarningsPaise: Math.max(0, Math.round(Number(user.dailyBonusEarningsPaise || 0))),
-    totalWithdrawnPaise: Math.max(0, Math.round(Number(user.totalWithdrawnPaise || 0))),
-    pendingWithdrawalPaise: Math.max(0, Math.round(Number(user.pendingWithdrawalPaise || 0))),
-    totalReferrals: Math.max(0, Math.round(Number(user.totalReferrals || 0))),
-    dailyBonusCount: Math.max(0, Math.round(Number(user.dailyBonusCount || 0))),
-    withdrawalCount: Math.max(0, Math.round(Number(user.withdrawalCount || 0))),
+    firstName: user.firstName || '',
+    lastName: user.lastName || '',
+    username: user.username || '',
+    joinedAt: toInt(user.joinedAt, now),
+    lastActiveAt: toInt(user.lastActiveAt, now),
+    status: user.status || 'active',
+    balancePaise: toNonNegInt(user.balancePaise),
+    totalEarnedPaise: toNonNegInt(user.totalEarnedPaise),
+    referralEarningsPaise: toNonNegInt(user.referralEarningsPaise),
+    dailyBonusEarningsPaise: toNonNegInt(user.dailyBonusEarningsPaise),
+    totalWithdrawnPaise: toNonNegInt(user.totalWithdrawnPaise),
+    pendingWithdrawalPaise: toNonNegInt(user.pendingWithdrawalPaise),
+    totalReferrals: toNonNegInt(user.totalReferrals),
+    referredBy: user.referredBy ? String(user.referredBy) : null,
+    pendingReferrerId: user.pendingReferrerId ? String(user.pendingReferrerId) : null,
+    referralCredited: Boolean(user.referralCredited),
+    lastDailyClaimAt:
+      user.lastDailyClaimAt !== null && user.lastDailyClaimAt !== undefined
+        ? toInt(user.lastDailyClaimAt)
+        : null,
+    dailyBonusCount: toNonNegInt(user.dailyBonusCount),
+    lastApprovedWithdrawalAt:
+      user.lastApprovedWithdrawalAt !== null && user.lastApprovedWithdrawalAt !== undefined
+        ? toInt(user.lastApprovedWithdrawalAt)
+        : null,
+    activePendingWithdrawalId: user.activePendingWithdrawalId || null,
+    forceJoinVerified: Boolean(user.forceJoinVerified),
+    withdrawalCount: toNonNegInt(user.withdrawalCount),
   };
-  await kvPutJson(env, `user:${normalized.id}`, normalized);
+
+  await db
+    .prepare(
+      `INSERT INTO users (
+        telegram_id, first_name, last_name, username, joined_at, last_active_at, status,
+        balance_paise, total_earned_paise, referral_earnings_paise, daily_bonus_earnings_paise,
+        total_withdrawn_paise, pending_withdrawal_paise, total_referrals,
+        referred_by, pending_referrer_id, referral_credited,
+        last_daily_claim_at, daily_bonus_count, last_approved_withdrawal_at,
+        active_pending_withdrawal_id, force_join_verified, withdrawal_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(telegram_id) DO UPDATE SET
+        first_name = excluded.first_name,
+        last_name = excluded.last_name,
+        username = excluded.username,
+        last_active_at = excluded.last_active_at,
+        status = excluded.status,
+        balance_paise = excluded.balance_paise,
+        total_earned_paise = excluded.total_earned_paise,
+        referral_earnings_paise = excluded.referral_earnings_paise,
+        daily_bonus_earnings_paise = excluded.daily_bonus_earnings_paise,
+        total_withdrawn_paise = excluded.total_withdrawn_paise,
+        pending_withdrawal_paise = excluded.pending_withdrawal_paise,
+        total_referrals = excluded.total_referrals,
+        referred_by = excluded.referred_by,
+        pending_referrer_id = excluded.pending_referrer_id,
+        referral_credited = excluded.referral_credited,
+        last_daily_claim_at = excluded.last_daily_claim_at,
+        daily_bonus_count = excluded.daily_bonus_count,
+        last_approved_withdrawal_at = excluded.last_approved_withdrawal_at,
+        active_pending_withdrawal_id = excluded.active_pending_withdrawal_id,
+        force_join_verified = excluded.force_join_verified,
+        withdrawal_count = excluded.withdrawal_count`
+    )
+    .bind(
+      normalized.id,
+      normalized.firstName,
+      normalized.lastName,
+      normalized.username,
+      normalized.joinedAt,
+      normalized.lastActiveAt,
+      normalized.status,
+      normalized.balancePaise,
+      normalized.totalEarnedPaise,
+      normalized.referralEarningsPaise,
+      normalized.dailyBonusEarningsPaise,
+      normalized.totalWithdrawnPaise,
+      normalized.pendingWithdrawalPaise,
+      normalized.totalReferrals,
+      normalized.referredBy,
+      normalized.pendingReferrerId,
+      normalized.referralCredited ? 1 : 0,
+      normalized.lastDailyClaimAt,
+      normalized.dailyBonusCount,
+      normalized.lastApprovedWithdrawalAt,
+      normalized.activePendingWithdrawalId,
+      normalized.forceJoinVerified ? 1 : 0,
+      normalized.withdrawalCount
+    )
+    .run();
+
   return normalized;
 }
 
 export async function getUserIds(env) {
-  const index = await kvGetJson(env, 'users:index', null);
-  if (Array.isArray(index)) return index;
-  return [];
+  const db = assertDB(env);
+  const res = await db
+    .prepare('SELECT telegram_id FROM users ORDER BY joined_at DESC')
+    .all();
+  return (res.results || []).map((r) => String(r.telegram_id));
 }
 
-export async function addUserToIndex(env, telegramId) {
-  const id = String(telegramId);
-  const index = await getUserIds(env);
-  if (!index.includes(id)) {
-    index.unshift(id);
-    await kvPutJson(env, 'users:index', index);
-  }
-  return index;
+export async function getBroadcastAudienceCounts(env) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare(
+      `SELECT
+        SUM(CASE WHEN status <> 'blocked_bot' THEN 1 ELSE 0 END) AS eligible,
+        SUM(CASE WHEN status = 'blocked_bot' THEN 1 ELSE 0 END) AS blocked
+       FROM users`
+    )
+    .first();
+  return {
+    eligibleCount: toNonNegInt(row?.eligible),
+    skippedBlocked: toNonNegInt(row?.blocked),
+  };
+}
+
+export async function getBroadcastEligibleUserIds(env) {
+  const db = assertDB(env);
+  const res = await db
+    .prepare("SELECT telegram_id FROM users WHERE status <> 'blocked_bot' ORDER BY joined_at DESC")
+    .all();
+  return (res.results || []).map((r) => String(r.telegram_id));
 }
 
 export async function createOrUpdateUserFromTelegram(env, tgUser) {
+  const db = assertDB(env);
   const id = String(tgUser.id);
   const now = Date.now();
-  const existing = await getUser(env, id);
+  const firstName = tgUser.first_name || '';
+  const lastName = tgUser.last_name || '';
+  const username = tgUser.username || '';
 
-  if (existing) {
-    const updated = {
-      ...existing,
-      firstName: tgUser.first_name || existing.firstName || '',
-      lastName: tgUser.last_name || '',
-      username: tgUser.username || '',
-      lastActiveAt: now,
-      status: existing.status === 'blocked_bot' ? 'active' : existing.status || 'active',
-    };
-    await saveUser(env, updated);
-    return { user: updated, isNew: false };
+  // Atomic insert-if-new so concurrent /start requests cannot overwrite an existing user
+  const insertRes = await db
+    .prepare(
+      `INSERT OR IGNORE INTO users (
+        telegram_id, first_name, last_name, username, joined_at, last_active_at, status
+      ) VALUES (?, ?, ?, ?, ?, ?, 'active')`
+    )
+    .bind(id, firstName, lastName, username, now, now)
+    .run();
+
+  const isNew = Number(insertRes?.meta?.changes ?? 0) > 0;
+
+  if (!isNew) {
+    await db
+      .prepare(
+        `UPDATE users
+         SET first_name = CASE WHEN ? <> '' THEN ? ELSE first_name END,
+             last_name = ?,
+             username = ?,
+             last_active_at = ?,
+             status = CASE WHEN status = 'blocked_bot' THEN 'active' ELSE status END
+         WHERE telegram_id = ?`
+      )
+      .bind(firstName, firstName, lastName, username, now, id)
+      .run();
   }
 
-  const newUser = {
-    id,
-    firstName: tgUser.first_name || '',
-    lastName: tgUser.last_name || '',
-    username: tgUser.username || '',
-    joinedAt: now,
-    lastActiveAt: now,
-    status: 'active', // active | banned | blocked_bot
-    balancePaise: 0,
-    totalEarnedPaise: 0,
-    referralEarningsPaise: 0,
-    dailyBonusEarningsPaise: 0,
-    totalWithdrawnPaise: 0,
-    pendingWithdrawalPaise: 0,
-    totalReferrals: 0,
-    referredBy: null,
-    pendingReferrerId: null,
-    referralCredited: false,
-    lastDailyClaimAt: null,
-    dailyBonusCount: 0,
-    lastApprovedWithdrawalAt: null,
-    activePendingWithdrawalId: null,
-    forceJoinVerified: false,
-    withdrawalCount: 0,
-  };
-
-  await saveUser(env, newUser);
-  await addUserToIndex(env, id);
-  return { user: newUser, isNew: true };
+  const user = await getUser(env, id);
+  return { user, isNew };
 }
 
 export async function markUserBlocked(env, telegramId) {
-  const user = await getUser(env, telegramId);
-  if (!user) return;
-  if (user.status !== 'banned') {
-    user.status = 'blocked_bot';
-    await saveUser(env, user);
-  }
+  const db = assertDB(env);
+  await db
+    .prepare(
+      `UPDATE users
+       SET status = 'blocked_bot'
+       WHERE telegram_id = ? AND status <> 'banned'`
+    )
+    .bind(String(telegramId))
+    .run();
+}
+
+export async function updateUserForceJoinVerified(env, telegramId, verified) {
+  const db = assertDB(env);
+  await db
+    .prepare('UPDATE users SET force_join_verified = ? WHERE telegram_id = ?')
+    .bind(verified ? 1 : 0, String(telegramId))
+    .run();
+}
+
+export async function updateUserStatus(env, telegramId, status) {
+  const db = assertDB(env);
+  await db
+    .prepare('UPDATE users SET status = ? WHERE telegram_id = ?')
+    .bind(String(status), String(telegramId))
+    .run();
+}
+
+export async function setUserPendingReferrer(env, telegramId, referrerId) {
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `UPDATE users
+       SET pending_referrer_id = ?
+       WHERE telegram_id = ?
+         AND referred_by IS NULL
+         AND referral_credited = 0
+         AND pending_referrer_id IS NULL`
+    )
+    .bind(String(referrerId), String(telegramId))
+    .run();
+  return Number(res?.meta?.changes ?? 0) > 0;
+}
+
+export async function clearUserPendingReferrer(env, telegramId) {
+  const db = assertDB(env);
+  await db
+    .prepare('UPDATE users SET pending_referrer_id = NULL WHERE telegram_id = ?')
+    .bind(String(telegramId))
+    .run();
 }
 
 export async function getUsersPage(env, page = 1, pageSize = 10) {
-  const ids = await getUserIds(env);
-  const total = ids.length;
+  const db = assertDB(env);
+  const countRow = await db.prepare('SELECT COUNT(*) AS total FROM users').first();
+  const total = toNonNegInt(countRow?.total);
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const safePage = Math.min(Math.max(1, Number(page) || 1), totalPages);
-  const start = (safePage - 1) * pageSize;
-  const slice = ids.slice(start, start + pageSize);
-  const users = (await Promise.all(slice.map((id) => getUser(env, id)))).filter(Boolean);
+  const offset = (safePage - 1) * pageSize;
+
+  const res = await db
+    .prepare('SELECT * FROM users ORDER BY joined_at DESC LIMIT ? OFFSET ?')
+    .bind(pageSize, offset)
+    .all();
 
   return {
-    users,
+    users: (res.results || []).map(mapUserRow),
     page: safePage,
     pageSize,
     total,
@@ -328,92 +646,332 @@ export async function getUsersPage(env, page = 1, pageSize = 10) {
 }
 
 export async function countActiveUsers(env) {
-  const ids = await getUserIds(env);
+  const db = assertDB(env);
   const cutoff = Date.now() - ACTIVE_WINDOW_MS;
-  let active = 0;
-  // Batch reads in chunks of 50 to avoid excessive concurrent promises
-  for (let i = 0; i < ids.length; i += 50) {
-    const batch = ids.slice(i, i + 50);
-    const records = await Promise.all(batch.map((id) => getUser(env, id)));
-    for (const u of records) {
-      if (u && u.status === 'active' && Number(u.lastActiveAt || 0) >= cutoff) {
-        active++;
-      }
-    }
-  }
-  return { totalUsers: ids.length, activeUsers: active };
+  const row = await db
+    .prepare(
+      `SELECT
+        COUNT(*) AS total_users,
+        SUM(CASE WHEN status = 'active' AND last_active_at >= ? THEN 1 ELSE 0 END) AS active_users
+       FROM users`
+    )
+    .bind(cutoff)
+    .first();
+
+  return {
+    totalUsers: toNonNegInt(row?.total_users),
+    activeUsers: toNonNegInt(row?.active_users),
+  };
 }
 
 // ----------------------------------------------------------------------------
-// Conversation States
+// Conversation States (`user_states` table)
 // ----------------------------------------------------------------------------
 
 export async function getUserState(env, telegramId) {
-  return kvGetJson(env, `state:${String(telegramId)}`, null);
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT payload_json, expires_at FROM user_states WHERE user_id = ?')
+    .bind(String(telegramId))
+    .first();
+  if (!row) return null;
+  if (toInt(row.expires_at) < Date.now()) {
+    await clearUserState(env, telegramId);
+    return null;
+  }
+  return safeJsonParse(row.payload_json, null);
 }
 
 export async function setUserState(env, telegramId, state) {
-  await kvPutJson(
-    env,
-    `state:${String(telegramId)}`,
-    { ...state, updatedAt: Date.now() },
-    { expirationTtl: 1800 }
-  );
+  const db = assertDB(env);
+  const now = Date.now();
+  const expiresAt = now + 30 * 60 * 1000; // 30 minutes
+  const payload = { ...state, updatedAt: now };
+  await db
+    .prepare(
+      `INSERT INTO user_states (user_id, state_type, payload_json, updated_at, expires_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         state_type = excluded.state_type,
+         payload_json = excluded.payload_json,
+         updated_at = excluded.updated_at,
+         expires_at = excluded.expires_at`
+    )
+    .bind(String(telegramId), String(state?.type || 'unknown'), JSON.stringify(payload), now, expiresAt)
+    .run();
 }
 
 export async function clearUserState(env, telegramId) {
-  await kvDelete(env, `state:${String(telegramId)}`);
+  const db = assertDB(env);
+  await db
+    .prepare('DELETE FROM user_states WHERE user_id = ?')
+    .bind(String(telegramId))
+    .run();
 }
 
 // ----------------------------------------------------------------------------
-// Referrals Collection
+// Financial Ledger Queries (`ledger` table)
+// ----------------------------------------------------------------------------
+
+export async function getUserLedger(env, telegramId, limit = 50) {
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `SELECT * FROM ledger
+       WHERE user_id = ?
+       ORDER BY created_at DESC
+       LIMIT ?`
+    )
+    .bind(String(telegramId), Math.max(1, toInt(limit, 50)))
+    .all();
+  return (res.results || []).map(mapLedgerRow);
+}
+
+// ----------------------------------------------------------------------------
+// Referrals & Atomic Referral Credit Transaction (`referral_claims`, `referrals`, `ledger`)
 // ----------------------------------------------------------------------------
 
 export async function getReferralClaim(env, referredUserId) {
-  return kvGetJson(env, `ref_claim:${String(referredUserId)}`, null);
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT * FROM referral_claims WHERE referred_user_id = ?')
+    .bind(String(referredUserId))
+    .first();
+  if (!row) return null;
+  return {
+    referredUserId: String(row.referred_user_id),
+    referrerId: String(row.referrer_id),
+    amountPaise: toNonNegInt(row.amount_paise),
+    creditedAt: toInt(row.credited_at),
+  };
 }
 
-export async function saveReferralClaim(env, referredUserId, claimRecord) {
-  await kvPutJson(env, `ref_claim:${String(referredUserId)}`, claimRecord);
+export async function getUserReferrals(env, referrerId, limit = 50) {
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `SELECT * FROM referrals
+       WHERE referrer_id = ?
+       ORDER BY credited_at DESC
+       LIMIT ?`
+    )
+    .bind(String(referrerId), Math.max(1, toInt(limit, 50)))
+    .all();
+  return (res.results || []).map((row) => ({
+    id: String(row.id),
+    referrerId: String(row.referrer_id),
+    referredUserId: String(row.referred_user_id),
+    referredName: row.referred_name || '',
+    referredUsername: row.referred_username || '',
+    amountPaise: toNonNegInt(row.amount_paise),
+    creditedAt: toInt(row.credited_at),
+  }));
 }
 
-export async function getUserReferrals(env, referrerId) {
-  const list = await kvGetJson(env, `referrals:${String(referrerId)}`, []);
-  return Array.isArray(list) ? list : [];
-}
+/**
+ * Atomically credit a referral reward inside a single D1 transaction batch:
+ *   1. INSERT INTO referral_claims (PRIMARY KEY referred_user_id prevents duplicates)
+ *   2. INSERT INTO referrals (UNIQUE referred_user_id)
+ *   3. UPDATE referred user (referred_by, pending_referrer_id = NULL, referral_credited = 1)
+ *   4. UPDATE referrer balance & referral totals
+ *   5. INSERT INTO ledger (atomic credit audit entry)
+ */
+export async function executeReferralCreditTransaction(
+  env,
+  { referrerId, referredUserId, referredName, referredUsername, amountPaise, creditedAt = Date.now() }
+) {
+  const db = assertDB(env);
+  const safeAmount = toNonNegInt(amountPaise);
+  const refId = String(referrerId);
+  const uid = String(referredUserId);
+  const referralRowId = generateId('REF');
+  const ledgerId = generateId('LDG');
 
-export async function addUserReferral(env, referrerId, entry) {
-  const list = await getUserReferrals(env, referrerId);
-  if (!list.some((r) => String(r.referredUserId) === String(entry.referredUserId))) {
-    list.unshift(entry);
-    await kvPutJson(env, `referrals:${String(referrerId)}`, list);
+  const statements = [
+    db
+      .prepare(
+        `INSERT INTO referral_claims (referred_user_id, referrer_id, amount_paise, credited_at)
+         VALUES (?, ?, ?, ?)`
+      )
+      .bind(uid, refId, safeAmount, creditedAt),
+
+    db
+      .prepare(
+        `INSERT INTO referrals (id, referrer_id, referred_user_id, referred_name, referred_username, amount_paise, credited_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(referralRowId, refId, uid, String(referredName || ''), String(referredUsername || ''), safeAmount, creditedAt),
+
+    db
+      .prepare(
+        `UPDATE users
+         SET referred_by = ?, pending_referrer_id = NULL, referral_credited = 1
+         WHERE telegram_id = ?`
+      )
+      .bind(refId, uid),
+
+    db
+      .prepare(
+        `UPDATE users
+         SET balance_paise = balance_paise + ?,
+             total_earned_paise = total_earned_paise + ?,
+             referral_earnings_paise = referral_earnings_paise + ?,
+             total_referrals = total_referrals + 1
+         WHERE telegram_id = ?`
+      )
+      .bind(safeAmount, safeAmount, safeAmount, refId),
+  ];
+
+  if (safeAmount > 0) {
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO ledger (
+            id, user_id, entry_type, direction, amount_paise,
+            balance_before_paise, balance_after_paise,
+            reference_type, reference_id, description, created_at
+          )
+          SELECT ?, telegram_id, 'referral_credit', 'credit', ?,
+                 balance_paise - ?, balance_paise,
+                 'referral', ?, ?, ?
+          FROM users
+          WHERE telegram_id = ?`
+        )
+        .bind(
+          ledgerId,
+          safeAmount,
+          safeAmount,
+          uid,
+          `Referral reward for inviting user ${uid}`,
+          creditedAt,
+          refId
+        )
+    );
   }
-  return list;
+
+  try {
+    await db.batch(statements);
+    const updatedReferrer = await getUser(env, refId);
+    return { ok: true, referrer: updatedReferrer };
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('UNIQUE') || msg.includes('PRIMARY KEY') || msg.includes('CONSTRAINT')) {
+      return { ok: false, duplicate: true, error: 'Referral already claimed.' };
+    }
+    throw err;
+  }
 }
 
 // ----------------------------------------------------------------------------
-// Daily Bonus Claims Collection
+// Daily Bonus Claims & Atomic Claim Transaction (`daily_claims`, `users`, `ledger`)
 // ----------------------------------------------------------------------------
 
-export async function getDailyBonusHistory(env, telegramId) {
-  const list = await kvGetJson(env, `daily_claims:${String(telegramId)}`, []);
-  return Array.isArray(list) ? list : [];
+export async function getDailyBonusHistory(env, telegramId, limit = 180) {
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `SELECT * FROM daily_claims
+       WHERE user_id = ?
+       ORDER BY claimed_at DESC
+       LIMIT ?`
+    )
+    .bind(String(telegramId), Math.max(1, toInt(limit, 180)))
+    .all();
+  return (res.results || []).map((row) => ({
+    id: String(row.id),
+    userId: String(row.user_id),
+    amountPaise: toNonNegInt(row.amount_paise),
+    istDate: String(row.ist_date),
+    claimedAt: toInt(row.claimed_at),
+  }));
 }
 
-export async function addDailyBonusClaim(env, telegramId, claim) {
-  const list = await getDailyBonusHistory(env, telegramId);
-  list.unshift(claim);
-  // Keep latest 180 claims per user
-  const trimmed = list.slice(0, 180);
-  await kvPutJson(env, `daily_claims:${String(telegramId)}`, trimmed);
-  return trimmed;
+/**
+ * Atomically claim a daily bonus inside ONE D1 transaction batch:
+ *   1. INSERT INTO daily_claims (protected by UNIQUE(user_id, ist_date) AND trg_daily_claims_24h_guard)
+ *   2. UPDATE users (balance_paise, total_earned_paise, daily_bonus_earnings_paise, last_daily_claim_at, daily_bonus_count)
+ *   3. INSERT INTO ledger (atomic credit audit entry)
+ */
+export async function executeDailyBonusClaimTransaction(
+  env,
+  { userId, amountPaise, istDate, claimedAt = Date.now() }
+) {
+  const db = assertDB(env);
+  const uid = String(userId);
+  const safeAmount = Math.max(1, toInt(amountPaise, 25));
+  const claimId = generateId('DBN');
+  const ledgerId = generateId('LDG');
+
+  const statements = [
+    db
+      .prepare(
+        `INSERT INTO daily_claims (id, user_id, amount_paise, ist_date, claimed_at)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .bind(claimId, uid, safeAmount, String(istDate), claimedAt),
+
+    db
+      .prepare(
+        `UPDATE users
+         SET balance_paise = balance_paise + ?,
+             total_earned_paise = total_earned_paise + ?,
+             daily_bonus_earnings_paise = daily_bonus_earnings_paise + ?,
+             last_daily_claim_at = ?,
+             daily_bonus_count = daily_bonus_count + 1
+         WHERE telegram_id = ?`
+      )
+      .bind(safeAmount, safeAmount, safeAmount, claimedAt, uid),
+
+    db
+      .prepare(
+        `INSERT INTO ledger (
+          id, user_id, entry_type, direction, amount_paise,
+          balance_before_paise, balance_after_paise,
+          reference_type, reference_id, description, created_at
+        )
+        SELECT ?, telegram_id, 'daily_bonus_credit', 'credit', ?,
+               balance_paise - ?, balance_paise,
+               'daily_claim', ?, ?, ?
+        FROM users
+        WHERE telegram_id = ?`
+      )
+      .bind(
+        ledgerId,
+        safeAmount,
+        safeAmount,
+        claimId,
+        `Daily bonus claim (${istDate})`,
+        claimedAt,
+        uid
+      ),
+  ];
+
+  try {
+    await db.batch(statements);
+    const updatedUser = await getUser(env, uid);
+    return {
+      ok: true,
+      claim: { id: claimId, userId: uid, amountPaise: safeAmount, istDate, claimedAt },
+      user: updatedUser,
+    };
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (
+      msg.includes('DAILY_CLAIM_COOLDOWN') ||
+      msg.includes('UNIQUE') ||
+      msg.includes('CONSTRAINT')
+    ) {
+      return { ok: false, alreadyClaimed: true, error: 'Daily bonus already claimed.' };
+    }
+    throw err;
+  }
 }
 
 // ----------------------------------------------------------------------------
-// Vouchers & Global Duplicate Code Index
+// Vouchers Inventory (`vouchers` table — Global UNIQUE duplicate prevention)
 // ----------------------------------------------------------------------------
 
-async function hashVoucherCode(normalizedCode) {
+export async function hashVoucherCode(normalizedCode) {
   const data = new TextEncoder().encode(normalizedCode);
   const digest = await crypto.subtle.digest('SHA-256', data);
   return Array.from(new Uint8Array(digest))
@@ -421,67 +979,193 @@ async function hashVoucherCode(normalizedCode) {
     .join('');
 }
 
-export async function getVoucherCodeKey(code) {
-  const normalized = normalizeVoucherCode(code);
-  const hash = await hashVoucherCode(normalized);
-  return `vcode:${hash}`;
-}
-
 export async function getVoucherIdByCode(env, code) {
-  const key = await getVoucherCodeKey(code);
-  return assertKV(env).get(key);
-}
-
-export async function registerVoucherCodeIndex(env, code, voucherId) {
-  const key = await getVoucherCodeKey(code);
-  await assertKV(env).put(key, String(voucherId));
+  const db = assertDB(env);
+  const normalized = normalizeVoucherCode(code);
+  const row = await db
+    .prepare('SELECT id FROM vouchers WHERE normalized_code = ?')
+    .bind(normalized)
+    .first();
+  return row ? String(row.id) : null;
 }
 
 export async function getVoucher(env, voucherId) {
-  return kvGetJson(env, `voucher:${String(voucherId)}`, null);
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT * FROM vouchers WHERE id = ?')
+    .bind(String(voucherId))
+    .first();
+  return mapVoucherRow(row);
 }
 
-export async function saveVoucher(env, voucher) {
-  await kvPutJson(env, `voucher:${String(voucher.id)}`, voucher);
-  return voucher;
+export async function getAvailableVouchersByCategory(env, category, limit = 10) {
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `SELECT * FROM vouchers
+       WHERE category = ? AND status = 'available'
+       ORDER BY added_at ASC, id ASC
+       LIMIT ?`
+    )
+    .bind(String(category), Math.max(1, toInt(limit, 10)))
+    .all();
+  return (res.results || []).map(mapVoucherRow);
 }
 
-export async function getCategoryIndex(env, category) {
-  const data = await kvGetJson(env, `vouchers:cat:${category}`, null);
-  if (data && Array.isArray(data.availableIds) && Array.isArray(data.allIds)) {
-    return data;
+export async function countAvailableVouchersByCategory(env, category) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM vouchers WHERE category = ? AND status = 'available'")
+    .bind(String(category))
+    .first();
+  return toNonNegInt(row?.cnt);
+}
+
+/**
+ * Bulk-insert normalized voucher rows with INSERT OR IGNORE on global UNIQUE(normalized_code, code_hash).
+ * Uses chunked D1 batches for speed and atomicity.
+ */
+export async function bulkInsertVouchers(env, records) {
+  const db = assertDB(env);
+  if (!records.length) return { addedCount: 0, duplicateCount: 0 };
+
+  let addedCount = 0;
+  let duplicateCount = 0;
+  const CHUNK_SIZE = 40;
+
+  for (let i = 0; i < records.length; i += CHUNK_SIZE) {
+    const chunk = records.slice(i, i + CHUNK_SIZE);
+    const statements = chunk.map((v) =>
+      db
+        .prepare(
+          `INSERT OR IGNORE INTO vouchers (
+            id, code, normalized_code, code_hash, category, value_paise,
+            status, added_at, added_by
+          ) VALUES (?, ?, ?, ?, ?, ?, 'available', ?, ?)`
+        )
+        .bind(
+          v.id,
+          v.code,
+          v.normalizedCode,
+          v.codeHash,
+          v.category,
+          toNonNegInt(v.valuePaise),
+          toInt(v.addedAt),
+          String(v.addedBy)
+        )
+    );
+
+    const results = await db.batch(statements);
+    for (const res of results) {
+      if (Number(res?.meta?.changes ?? 0) > 0) {
+        addedCount++;
+      } else {
+        duplicateCount++;
+      }
+    }
   }
-  return { availableIds: [], allIds: [] };
+
+  return { addedCount, duplicateCount };
 }
 
-export async function saveCategoryIndex(env, category, index) {
-  await kvPutJson(env, `vouchers:cat:${category}`, {
-    availableIds: Array.from(new Set(index.availableIds || [])),
-    allIds: Array.from(new Set(index.allIds || [])),
-  });
+/**
+ * Atomically reserve ONE genuinely available voucher in a single SQL statement.
+ * Prevents double-issuance across concurrent admin approvals.
+ */
+export async function atomicReserveAvailableVoucher(env, category, userId, withdrawalRequestId) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare(
+      `UPDATE vouchers
+       SET status = 'reserved',
+           assigned_user_id = ?,
+           withdrawal_request_id = ?
+       WHERE id = (
+         SELECT id FROM vouchers
+         WHERE category = ? AND status = 'available'
+         ORDER BY added_at ASC, id ASC
+         LIMIT 1
+       )
+       AND status = 'available'
+       RETURNING *`
+    )
+    .bind(String(userId), String(withdrawalRequestId), String(category))
+    .first();
+
+  if (!row) return null;
+  return mapVoucherRow(row);
+}
+
+/**
+ * Release a reserved voucher back to available if approval aborts before completion.
+ */
+export async function releaseReservedVoucherRow(env, voucherId) {
+  if (!voucherId) return;
+  const db = assertDB(env);
+  await db
+    .prepare(
+      `UPDATE vouchers
+       SET status = 'available',
+           assigned_user_id = NULL,
+           withdrawal_request_id = NULL
+       WHERE id = ? AND status = 'reserved'`
+    )
+    .bind(String(voucherId))
+    .run();
+}
+
+/**
+ * Atomically disable an available voucher.
+ */
+export async function disableAvailableVoucherRow(env, voucherId, adminId, disabledAt = Date.now()) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare(
+      `UPDATE vouchers
+       SET status = 'disabled',
+           disabled_at = ?,
+           disabled_by = ?
+       WHERE id = ? AND status = 'available'
+       RETURNING *`
+    )
+    .bind(disabledAt, String(adminId), String(voucherId))
+    .first();
+  return mapVoucherRow(row);
 }
 
 export async function getAllCategoryStockSummary(env) {
-  const settings = await getSettings(env);
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `SELECT
+        category,
+        COUNT(*) AS total_added,
+        SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) AS available_count,
+        SUM(CASE WHEN status = 'available' THEN value_paise ELSE 0 END) AS available_value_paise
+       FROM vouchers
+       GROUP BY category`
+    )
+    .all();
+
+  const byCat = new Map();
+  for (const row of res.results || []) {
+    byCat.set(String(row.category), row);
+  }
+
   const summary = {};
   let totalAvailable = 0;
   let totalValuePaise = 0;
 
   for (const cat of VOUCHER_CATEGORY_LIST) {
-    const idx = await getCategoryIndex(env, cat.key);
-    const availableCount = idx.availableIds.length;
-    // Compute exact available value if small, or sample/sum up to 200
-    let catValuePaise = availableCount * settings.defaultVoucherValuePaise;
-    if (availableCount > 0 && availableCount <= 100) {
-      const records = await Promise.all(idx.availableIds.map((id) => getVoucher(env, id)));
-      catValuePaise = records
-        .filter((v) => v && v.status === 'available')
-        .reduce((acc, v) => acc + Number(v.valuePaise || settings.defaultVoucherValuePaise), 0);
-    }
+    const row = byCat.get(cat.key);
+    const availableCount = toNonNegInt(row?.available_count);
+    const totalAddedCount = toNonNegInt(row?.total_added);
+    const catValuePaise = toNonNegInt(row?.available_value_paise);
+
     summary[cat.key] = {
       ...cat,
       availableCount,
-      totalAddedCount: idx.allIds.length,
+      totalAddedCount,
       inStock: availableCount > 0,
       valuePaise: catValuePaise,
     };
@@ -497,41 +1181,33 @@ export async function getAllCategoryStockSummary(env) {
 }
 
 // ----------------------------------------------------------------------------
-// Voucher History Collection (Permanent Delivery Log)
+// Voucher History Collection (`voucher_history` table)
 // ----------------------------------------------------------------------------
 
-export async function addVoucherHistory(env, record) {
-  await kvPutJson(env, `vhist:${record.id}`, record);
-
-  const globalIndex = await kvGetJson(env, 'voucher_history:index', []);
-  globalIndex.unshift(record.id);
-  await kvPutJson(env, 'voucher_history:index', globalIndex);
-
-  const userKey = `user_vhist:${String(record.userId)}`;
-  const userIndex = await kvGetJson(env, userKey, []);
-  userIndex.unshift(record.id);
-  await kvPutJson(env, userKey, userIndex);
-
-  return record;
-}
-
 export async function getVoucherHistoryRecord(env, historyId) {
-  return kvGetJson(env, `vhist:${String(historyId)}`, null);
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT * FROM voucher_history WHERE id = ?')
+    .bind(String(historyId))
+    .first();
+  return mapVoucherHistoryRow(row);
 }
 
 export async function getVoucherHistoryPage(env, page = 1, pageSize = 5) {
-  const ids = await kvGetJson(env, 'voucher_history:index', []);
-  const total = ids.length;
+  const db = assertDB(env);
+  const countRow = await db.prepare('SELECT COUNT(*) AS total FROM voucher_history').first();
+  const total = toNonNegInt(countRow?.total);
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const safePage = Math.min(Math.max(1, Number(page) || 1), totalPages);
-  const start = (safePage - 1) * pageSize;
-  const slice = ids.slice(start, start + pageSize);
-  const items = (await Promise.all(slice.map((id) => getVoucherHistoryRecord(env, id)))).filter(
-    Boolean
-  );
+  const offset = (safePage - 1) * pageSize;
+
+  const res = await db
+    .prepare('SELECT * FROM voucher_history ORDER BY delivered_at DESC LIMIT ? OFFSET ?')
+    .bind(pageSize, offset)
+    .all();
 
   return {
-    items,
+    items: (res.results || []).map(mapVoucherHistoryRow),
     page: safePage,
     pageSize,
     total,
@@ -540,82 +1216,410 @@ export async function getVoucherHistoryPage(env, page = 1, pageSize = 5) {
 }
 
 export async function getUserVoucherHistory(env, telegramId, limit = 15) {
-  const ids = await kvGetJson(env, `user_vhist:${String(telegramId)}`, []);
-  const slice = ids.slice(0, limit);
-  const items = (await Promise.all(slice.map((id) => getVoucherHistoryRecord(env, id)))).filter(
-    Boolean
-  );
-  // Strict ownership filter so another user's code can NEVER leak
-  return items.filter((item) => String(item.userId) === String(telegramId));
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `SELECT * FROM voucher_history
+       WHERE user_id = ?
+       ORDER BY delivered_at DESC
+       LIMIT ?`
+    )
+    .bind(String(telegramId), Math.max(1, toInt(limit, 15)))
+    .all();
+  // Strict per-user ownership isolation
+  return (res.results || [])
+    .map(mapVoucherHistoryRow)
+    .filter((item) => String(item.userId) === String(telegramId));
 }
 
 // ----------------------------------------------------------------------------
-// Withdrawals Collection
+// Withdrawals & Atomic Financial Lifecycle (`withdrawals`, `users`, `vouchers`, `voucher_history`, `ledger`)
 // ----------------------------------------------------------------------------
 
 export async function getWithdrawal(env, requestId) {
-  return kvGetJson(env, `withdrawal:${String(requestId)}`, null);
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT * FROM withdrawals WHERE id = ?')
+    .bind(String(requestId))
+    .first();
+  return mapWithdrawalRow(row);
 }
 
-export async function saveWithdrawal(env, withdrawal) {
-  await kvPutJson(env, `withdrawal:${String(withdrawal.id)}`, withdrawal);
-  return withdrawal;
+export async function countPendingWithdrawals(env) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare("SELECT COUNT(*) AS total FROM withdrawals WHERE status = 'pending'")
+    .first();
+  return toNonNegInt(row?.total);
 }
 
 export async function getPendingWithdrawalIds(env) {
-  const list = await kvGetJson(env, 'withdrawals:pending', []);
-  return Array.isArray(list) ? list : [];
+  const db = assertDB(env);
+  const res = await db
+    .prepare("SELECT id FROM withdrawals WHERE status = 'pending' ORDER BY created_at DESC")
+    .all();
+  return (res.results || []).map((r) => String(r.id));
 }
 
-export async function addPendingWithdrawalId(env, requestId) {
-  const list = await getPendingWithdrawalIds(env);
-  if (!list.includes(requestId)) {
-    list.unshift(requestId);
-    await kvPutJson(env, 'withdrawals:pending', list);
-  }
-}
+export async function getPendingWithdrawalsPage(env, page = 1, pageSize = 5) {
+  const db = assertDB(env);
+  const total = await countPendingWithdrawals(env);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(Math.max(1, Number(page) || 1), totalPages);
+  const offset = (safePage - 1) * pageSize;
 
-export async function removePendingWithdrawalId(env, requestId) {
-  const list = await getPendingWithdrawalIds(env);
-  const filtered = list.filter((id) => id !== requestId);
-  await kvPutJson(env, 'withdrawals:pending', filtered);
-}
+  const res = await db
+    .prepare(
+      "SELECT * FROM withdrawals WHERE status = 'pending' ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    )
+    .bind(pageSize, offset)
+    .all();
 
-export async function getAllWithdrawalIds(env) {
-  const list = await kvGetJson(env, 'withdrawals:all', []);
-  return Array.isArray(list) ? list : [];
-}
-
-export async function addAllWithdrawalId(env, requestId) {
-  const list = await getAllWithdrawalIds(env);
-  if (!list.includes(requestId)) {
-    list.unshift(requestId);
-    await kvPutJson(env, 'withdrawals:all', list);
-  }
-}
-
-export async function getUserWithdrawalIds(env, telegramId) {
-  const list = await kvGetJson(env, `user_withdrawals:${String(telegramId)}`, []);
-  return Array.isArray(list) ? list : [];
-}
-
-export async function addUserWithdrawalId(env, telegramId, requestId) {
-  const list = await getUserWithdrawalIds(env, telegramId);
-  if (!list.includes(requestId)) {
-    list.unshift(requestId);
-    await kvPutJson(env, `user_withdrawals:${String(telegramId)}`, list);
-  }
+  return {
+    items: (res.results || []).map(mapWithdrawalRow),
+    page: safePage,
+    pageSize,
+    total,
+    totalPages,
+  };
 }
 
 export async function getUserWithdrawals(env, telegramId, limit = 15) {
-  const ids = await getUserWithdrawalIds(env, telegramId);
-  const slice = ids.slice(0, limit);
-  const records = (await Promise.all(slice.map((id) => getWithdrawal(env, id)))).filter(Boolean);
-  return records.filter((w) => String(w.userId) === String(telegramId));
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `SELECT * FROM withdrawals
+       WHERE user_id = ?
+       ORDER BY created_at DESC
+       LIMIT ?`
+    )
+    .bind(String(telegramId), Math.max(1, toInt(limit, 15)))
+    .all();
+  return (res.results || [])
+    .map(mapWithdrawalRow)
+    .filter((w) => String(w.userId) === String(telegramId));
+}
+
+export async function getUserActivePendingWithdrawal(env, telegramId) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare("SELECT * FROM withdrawals WHERE user_id = ? AND status = 'pending' LIMIT 1")
+    .bind(String(telegramId))
+    .first();
+  return mapWithdrawalRow(row);
+}
+
+/**
+ * Atomically reserve user balance, create a pending withdrawal, and write a ledger entry.
+ * Enforced by:
+ *   - CHECK (balance_paise >= 0) -> aborts if concurrent debit would make balance negative
+ *   - Partial UNIQUE index on withdrawals(user_id) WHERE status = 'pending' -> aborts duplicate pending requests
+ *   - UNIQUE(entry_type, reference_type, reference_id) on ledger
+ */
+export async function executeCreateWithdrawalTransaction(env, withdrawal) {
+  const db = assertDB(env);
+  const safeAmount = toNonNegInt(withdrawal.amountPaise);
+  const uid = String(withdrawal.userId);
+  const ledgerId = generateId('LDG');
+
+  const statements = [
+    db
+      .prepare(
+        `UPDATE users
+         SET balance_paise = balance_paise - ?,
+             pending_withdrawal_paise = pending_withdrawal_paise + ?,
+             active_pending_withdrawal_id = ?
+         WHERE telegram_id = ?`
+      )
+      .bind(safeAmount, safeAmount, withdrawal.id, uid),
+
+    db
+      .prepare(
+        `INSERT INTO withdrawals (
+          id, user_id, username, user_name, amount_paise, category, status,
+          created_at, user_balance_snapshot_paise
+        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+      )
+      .bind(
+        withdrawal.id,
+        uid,
+        String(withdrawal.username || ''),
+        String(withdrawal.userName || ''),
+        safeAmount,
+        String(withdrawal.category),
+        toInt(withdrawal.createdAt),
+        toNonNegInt(withdrawal.userBalanceSnapshotPaise)
+      ),
+
+    db
+      .prepare(
+        `INSERT INTO ledger (
+          id, user_id, entry_type, direction, amount_paise,
+          balance_before_paise, balance_after_paise,
+          reference_type, reference_id, description, created_at
+        )
+        SELECT ?, telegram_id, 'withdrawal_reserve', 'reserve', ?,
+               balance_paise + ?, balance_paise,
+               'withdrawal', ?, ?, ?
+        FROM users
+        WHERE telegram_id = ?`
+      )
+      .bind(
+        ledgerId,
+        safeAmount,
+        safeAmount,
+        withdrawal.id,
+        `Reserved balance for withdrawal ${withdrawal.id} (${withdrawal.category})`,
+        toInt(withdrawal.createdAt),
+        uid
+      ),
+  ];
+
+  try {
+    await db.batch(statements);
+    const updatedUser = await getUser(env, uid);
+    return { ok: true, withdrawal, user: updatedUser };
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('balance_paise') || msg.includes('CHECK')) {
+      return { ok: false, error: 'Insufficient available balance.' };
+    }
+    if (msg.includes('UNIQUE') || msg.includes('idx_withdrawals_one_pending_per_user')) {
+      return {
+        ok: false,
+        error: '⏳ You already have a pending withdrawal request. Please wait for admin review.',
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Atomically approve a pending withdrawal, finalize reserved voucher delivery,
+ * insert permanent voucher_history, finalize user balance & 24h cooldown, and write ledger.
+ */
+export async function executeApproveWithdrawalTransaction(
+  env,
+  { withdrawal, voucher, adminId, processedAt = Date.now(), historyId }
+) {
+  const db = assertDB(env);
+  const safeAmount = toNonNegInt(withdrawal.amountPaise);
+  const uid = String(withdrawal.userId);
+  const aid = String(adminId);
+  const hId = historyId || generateId('VH');
+  const ledgerId = generateId('LDG');
+
+  const statements = [
+    // Trigger `trg_withdrawals_only_pending_transition` aborts atomically if status != 'pending'
+    db
+      .prepare(
+        `UPDATE withdrawals
+         SET status = 'approved',
+             processed_at = ?,
+             processed_by = ?,
+             voucher_id = ?,
+             voucher_code = ?
+         WHERE id = ?`
+      )
+      .bind(processedAt, aid, voucher.id, voucher.code, withdrawal.id),
+
+    db
+      .prepare(
+        `UPDATE vouchers
+         SET status = 'delivered',
+             approved_by = ?,
+             delivered_at = ?,
+             assigned_user_id = ?,
+             withdrawal_request_id = ?
+         WHERE id = ? AND status = 'reserved'`
+      )
+      .bind(aid, processedAt, uid, withdrawal.id, voucher.id),
+
+    db
+      .prepare(
+        `INSERT INTO voucher_history (
+          id, voucher_id, code, category, value_paise, user_id,
+          username, user_name, withdrawal_request_id, approved_by, delivered_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        hId,
+        voucher.id,
+        voucher.code,
+        voucher.category,
+        toNonNegInt(voucher.valuePaise),
+        uid,
+        String(withdrawal.username || ''),
+        String(withdrawal.userName || ''),
+        withdrawal.id,
+        aid,
+        processedAt
+      ),
+
+    db
+      .prepare(
+        `UPDATE users
+         SET pending_withdrawal_paise = pending_withdrawal_paise - ?,
+             total_withdrawn_paise = total_withdrawn_paise + ?,
+             withdrawal_count = withdrawal_count + 1,
+             last_approved_withdrawal_at = ?,
+             active_pending_withdrawal_id = CASE
+               WHEN active_pending_withdrawal_id = ? THEN NULL
+               ELSE active_pending_withdrawal_id
+             END
+         WHERE telegram_id = ?`
+      )
+      .bind(safeAmount, safeAmount, processedAt, withdrawal.id, uid),
+
+    db
+      .prepare(
+        `INSERT INTO ledger (
+          id, user_id, entry_type, direction, amount_paise,
+          balance_before_paise, balance_after_paise,
+          reference_type, reference_id, description, created_at
+        )
+        SELECT ?, telegram_id, 'withdrawal_finalize', 'debit', ?,
+               balance_paise, balance_paise,
+               'withdrawal', ?, ?, ?
+        FROM users
+        WHERE telegram_id = ?`
+      )
+      .bind(
+        ledgerId,
+        safeAmount,
+        withdrawal.id,
+        `Approved withdrawal ${withdrawal.id} — delivered voucher ${voucher.id}`,
+        processedAt,
+        uid
+      ),
+  ];
+
+  try {
+    await db.batch(statements);
+    const [updatedWithdrawal, updatedVoucher, updatedUser] = await Promise.all([
+      getWithdrawal(env, withdrawal.id),
+      getVoucher(env, voucher.id),
+      getUser(env, uid),
+    ]);
+    return {
+      ok: true,
+      withdrawal: updatedWithdrawal,
+      voucher: updatedVoucher,
+      user: updatedUser,
+      historyId: hId,
+    };
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (
+      msg.includes('WITHDRAWAL_ALREADY_PROCESSED') ||
+      msg.includes('UNIQUE') ||
+      msg.includes('CONSTRAINT')
+    ) {
+      return {
+        ok: false,
+        alreadyProcessed: true,
+        error: `Request ${withdrawal.id} has already been processed.`,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Atomically reject a pending withdrawal, refund 100% of reserved paise back to
+ * available balance, clear pending pointer, and record a ledger refund entry.
+ */
+export async function executeRejectWithdrawalTransaction(
+  env,
+  { withdrawal, adminId, reason = '', processedAt = Date.now() }
+) {
+  const db = assertDB(env);
+  const safeAmount = toNonNegInt(withdrawal.amountPaise);
+  const uid = String(withdrawal.userId);
+  const aid = String(adminId);
+  const cleanReason = String(reason || '').trim().slice(0, 250);
+  const ledgerId = generateId('LDG');
+
+  const statements = [
+    // Trigger `trg_withdrawals_only_pending_transition` aborts atomically if status != 'pending'
+    db
+      .prepare(
+        `UPDATE withdrawals
+         SET status = 'rejected',
+             processed_at = ?,
+             processed_by = ?,
+             rejection_reason = ?
+         WHERE id = ?`
+      )
+      .bind(processedAt, aid, cleanReason, withdrawal.id),
+
+    db
+      .prepare(
+        `UPDATE users
+         SET pending_withdrawal_paise = pending_withdrawal_paise - ?,
+             balance_paise = balance_paise + ?,
+             active_pending_withdrawal_id = CASE
+               WHEN active_pending_withdrawal_id = ? THEN NULL
+               ELSE active_pending_withdrawal_id
+             END
+         WHERE telegram_id = ?`
+      )
+      .bind(safeAmount, safeAmount, withdrawal.id, uid),
+
+    db
+      .prepare(
+        `INSERT INTO ledger (
+          id, user_id, entry_type, direction, amount_paise,
+          balance_before_paise, balance_after_paise,
+          reference_type, reference_id, description, created_at
+        )
+        SELECT ?, telegram_id, 'withdrawal_refund', 'release', ?,
+               balance_paise - ?, balance_paise,
+               'withdrawal', ?, ?, ?
+        FROM users
+        WHERE telegram_id = ?`
+      )
+      .bind(
+        ledgerId,
+        safeAmount,
+        safeAmount,
+        withdrawal.id,
+        `Refunded rejected withdrawal ${withdrawal.id}${cleanReason ? `: ${cleanReason}` : ''}`,
+        processedAt,
+        uid
+      ),
+  ];
+
+  try {
+    await db.batch(statements);
+    const [updatedWithdrawal, updatedUser] = await Promise.all([
+      getWithdrawal(env, withdrawal.id),
+      getUser(env, uid),
+    ]);
+    return {
+      ok: true,
+      withdrawal: updatedWithdrawal,
+      user: updatedUser,
+    };
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (
+      msg.includes('WITHDRAWAL_ALREADY_PROCESSED') ||
+      msg.includes('UNIQUE') ||
+      msg.includes('CONSTRAINT')
+    ) {
+      return {
+        ok: false,
+        alreadyProcessed: true,
+        error: `Request ${withdrawal.id} has already been processed.`,
+      };
+    }
+    throw err;
+  }
 }
 
 // ----------------------------------------------------------------------------
-// Admins Collection & Permission Checks
+// Admins Collection & Permission Checks (`admins` table)
 // ----------------------------------------------------------------------------
 
 export function isOwner(userId, env) {
@@ -624,12 +1628,70 @@ export function isOwner(userId, env) {
 }
 
 export async function getAdminsMap(env) {
-  const map = await kvGetJson(env, 'admins:list', {});
-  return map && typeof map === 'object' ? map : {};
+  const db = assertDB(env);
+  const res = await db.prepare('SELECT * FROM admins WHERE active = 1 ORDER BY added_at ASC').all();
+  const map = {};
+  for (const row of res.results || []) {
+    const id = String(row.telegram_id);
+    map[id] = {
+      id,
+      name: row.name || `Admin ${id}`,
+      username: row.username || '',
+      role: row.role || 'admin',
+      active: Boolean(row.active),
+      addedBy: row.added_by || '',
+      addedAt: toInt(row.added_at),
+      permissions: {
+        ...DEFAULT_ADMIN_PERMISSIONS,
+        ...safeJsonParse(row.permissions_json, {}),
+        manageAdmins: false,
+      },
+    };
+  }
+  return map;
 }
 
-export async function saveAdminsMap(env, map) {
-  await kvPutJson(env, 'admins:list', map || {});
+export async function upsertAdminRecord(env, record) {
+  const db = assertDB(env);
+  const now = Date.now();
+  const id = String(record.id);
+  const perms = {
+    ...DEFAULT_ADMIN_PERMISSIONS,
+    ...(record.permissions || {}),
+    manageSecretary: false,
+    manageAdmins: false,
+  };
+  await db
+    .prepare(
+      `INSERT INTO admins (
+        telegram_id, name, username, role, permissions_json, active, added_by, added_at, updated_at
+      ) VALUES (?, ?, ?, 'admin', ?, 1, ?, ?, ?)
+      ON CONFLICT(telegram_id) DO UPDATE SET
+        name = excluded.name,
+        username = excluded.username,
+        permissions_json = excluded.permissions_json,
+        active = 1,
+        updated_at = excluded.updated_at`
+    )
+    .bind(
+      id,
+      String(record.name || `Admin ${id}`),
+      String(record.username || ''),
+      JSON.stringify(perms),
+      String(record.addedBy || ''),
+      toInt(record.addedAt, now),
+      now
+    )
+    .run();
+}
+
+export async function removeAdminRecord(env, telegramId) {
+  const db = assertDB(env);
+  const res = await db
+    .prepare('DELETE FROM admins WHERE telegram_id = ?')
+    .bind(String(telegramId))
+    .run();
+  return Number(res?.meta?.changes ?? 0) > 0;
 }
 
 export async function getAdminRecord(env, userId) {
@@ -641,16 +1703,26 @@ export async function getAdminRecord(env, userId) {
       permissions: { ...OWNER_PERMISSIONS },
     };
   }
-  const map = await getAdminsMap(env);
-  const rec = map[id];
-  if (!rec || rec.active === false) return null;
+
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT * FROM admins WHERE telegram_id = ? AND active = 1')
+    .bind(id)
+    .first();
+  if (!row) return null;
+
   return {
-    ...rec,
     id,
+    name: row.name || `Admin ${id}`,
+    username: row.username || '',
     role: 'admin',
+    active: true,
+    addedBy: row.added_by || '',
+    addedAt: toInt(row.added_at),
     permissions: {
       ...DEFAULT_ADMIN_PERMISSIONS,
-      ...(rec.permissions || {}),
+      ...safeJsonParse(row.permissions_json, {}),
+      manageSecretary: false, // Owner-only configuration
       manageAdmins: false, // Owner-only enforcement
     },
   };
@@ -671,81 +1743,305 @@ export async function hasAdminPermission(userId, permission, env) {
 
 export async function getAllAdminIds(env) {
   const ownerId = getOwnerId(env);
-  const map = await getAdminsMap(env);
+  const db = assertDB(env);
+  const res = await db.prepare('SELECT telegram_id FROM admins WHERE active = 1').all();
   const ids = new Set([ownerId]);
-  for (const [id, rec] of Object.entries(map)) {
-    if (rec && rec.active !== false) {
-      ids.add(String(id));
-    }
+  for (const row of res.results || []) {
+    ids.add(String(row.telegram_id));
   }
   return Array.from(ids);
 }
 
 // ----------------------------------------------------------------------------
-// Force-Join Channels Collection
+// Force-Join Channels & Pending Join Requests (`force_join_channels`, `pending_join_requests`)
 // ----------------------------------------------------------------------------
 
 export async function getForceChannels(env) {
-  const list = await kvGetJson(env, 'force_channels:list', []);
-  return Array.isArray(list) ? list : [];
+  const db = assertDB(env);
+  const res = await db
+    .prepare('SELECT * FROM force_join_channels ORDER BY added_at ASC')
+    .all();
+  return (res.results || []).map(mapForceChannelRow);
+}
+
+export async function upsertForceChannel(env, channel) {
+  const db = assertDB(env);
+  const now = Date.now();
+  const id = String(channel.id || generateId('FJ'));
+  const chatId = String(channel.chatId);
+
+  await db
+    .prepare(
+      `INSERT INTO force_join_channels (
+        id, chat_id, username, title, invite_link, is_private, is_request_to_join, added_by, added_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(chat_id) DO UPDATE SET
+        username = excluded.username,
+        title = excluded.title,
+        invite_link = excluded.invite_link,
+        is_private = excluded.is_private,
+        is_request_to_join = excluded.is_request_to_join,
+        added_by = excluded.added_by`
+    )
+    .bind(
+      id,
+      chatId,
+      String(channel.username || ''),
+      String(channel.title || chatId),
+      String(channel.inviteLink || ''),
+      channel.isPrivate ? 1 : 0,
+      channel.isRequestToJoin ? 1 : 0,
+      String(channel.addedBy || ''),
+      toInt(channel.addedAt, now)
+    )
+    .run();
+
+  const row = await db
+    .prepare('SELECT * FROM force_join_channels WHERE chat_id = ?')
+    .bind(chatId)
+    .first();
+  return mapForceChannelRow(row);
+}
+
+export async function deleteForceChannel(env, channelId) {
+  const db = assertDB(env);
+  const existing = await db
+    .prepare('SELECT * FROM force_join_channels WHERE id = ?')
+    .bind(String(channelId))
+    .first();
+  if (!existing) return null;
+
+  await db
+    .prepare('DELETE FROM force_join_channels WHERE id = ?')
+    .bind(String(channelId))
+    .run();
+  return mapForceChannelRow(existing);
 }
 
 export async function saveForceChannels(env, channels) {
-  await kvPutJson(env, 'force_channels:list', Array.isArray(channels) ? channels : []);
-}
-
-// ----------------------------------------------------------------------------
-// Pending Join Requests Collection (Request-to-Join Force Channels)
-// Never treated as completed membership; used only for user status feedback.
-// ----------------------------------------------------------------------------
-
-function joinRequestKey(chatId, userId) {
-  return `join_req:${String(chatId)}:${String(userId)}`;
+  const db = assertDB(env);
+  const list = Array.isArray(channels) ? channels : [];
+  const statements = [db.prepare('DELETE FROM force_join_channels')];
+  for (const ch of list) {
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO force_join_channels (
+            id, chat_id, username, title, invite_link, is_private, is_request_to_join, added_by, added_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .bind(
+          String(ch.id || generateId('FJ')),
+          String(ch.chatId),
+          String(ch.username || ''),
+          String(ch.title || ch.chatId),
+          String(ch.inviteLink || ''),
+          ch.isPrivate ? 1 : 0,
+          ch.isRequestToJoin ? 1 : 0,
+          String(ch.addedBy || ''),
+          toInt(ch.addedAt, Date.now())
+        )
+    );
+  }
+  await db.batch(statements);
 }
 
 export async function recordPendingJoinRequest(env, chatId, userId, details = {}) {
-  const record = {
-    chatId: String(chatId),
-    userId: String(userId),
-    inviteLink: details.inviteLink || '',
-    requestedAt: Date.now(),
-    status: 'pending',
-  };
-  // Retain pending join-request awareness for 14 days unless cleared earlier on approval/rejection
-  await kvPutJson(env, joinRequestKey(chatId, userId), record, {
-    expirationTtl: 14 * 24 * 60 * 60,
-  });
-  return record;
+  const db = assertDB(env);
+  const now = Date.now();
+  const expiresAt = now + 14 * 24 * 60 * 60 * 1000;
+  const cid = String(chatId);
+  const uid = String(userId);
+  const inviteLink = String(details.inviteLink || '');
+
+  await db
+    .prepare(
+      `INSERT INTO pending_join_requests (chat_id, user_id, invite_link, status, requested_at, expires_at)
+       VALUES (?, ?, ?, 'pending', ?, ?)
+       ON CONFLICT(chat_id, user_id) DO UPDATE SET
+         invite_link = excluded.invite_link,
+         status = 'pending',
+         requested_at = excluded.requested_at,
+         expires_at = excluded.expires_at`
+    )
+    .bind(cid, uid, inviteLink, now, expiresAt)
+    .run();
+
+  return { chatId: cid, userId: uid, inviteLink, requestedAt: now, status: 'pending' };
 }
 
 export async function getPendingJoinRequest(env, chatId, userId) {
-  return kvGetJson(env, joinRequestKey(chatId, userId), null);
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT * FROM pending_join_requests WHERE chat_id = ? AND user_id = ?')
+    .bind(String(chatId), String(userId))
+    .first();
+  if (!row) return null;
+  if (toInt(row.expires_at) < Date.now()) {
+    await clearPendingJoinRequest(env, chatId, userId);
+    return null;
+  }
+  return {
+    chatId: String(row.chat_id),
+    userId: String(row.user_id),
+    inviteLink: row.invite_link || '',
+    requestedAt: toInt(row.requested_at),
+    status: row.status || 'pending',
+  };
 }
 
 export async function clearPendingJoinRequest(env, chatId, userId) {
-  await kvDelete(env, joinRequestKey(chatId, userId));
+  const db = assertDB(env);
+  await db
+    .prepare('DELETE FROM pending_join_requests WHERE chat_id = ? AND user_id = ?')
+    .bind(String(chatId), String(userId))
+    .run();
 }
 
 // ----------------------------------------------------------------------------
-// Admin Activity Logs Collection
+// Tasks & User Tasks (`tasks`, `user_tasks`, `ledger`)
+// ----------------------------------------------------------------------------
+
+export async function getActiveTasks(env) {
+  const db = assertDB(env);
+  const res = await db
+    .prepare("SELECT * FROM tasks WHERE status = 'active' ORDER BY created_at DESC")
+    .all();
+  return (res.results || []).map((row) => ({
+    id: String(row.id),
+    title: String(row.title),
+    description: row.description || '',
+    taskType: row.task_type || 'link',
+    targetUrl: row.target_url || '',
+    rewardPaise: toNonNegInt(row.reward_paise),
+    status: String(row.status),
+    createdBy: row.created_by || '',
+    createdAt: toInt(row.created_at),
+    updatedAt: toInt(row.updated_at),
+  }));
+}
+
+export async function createTaskRecord(env, task) {
+  const db = assertDB(env);
+  const now = Date.now();
+  const id = String(task.id || generateId('TSK'));
+  await db
+    .prepare(
+      `INSERT INTO tasks (id, title, description, task_type, target_url, reward_paise, status, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`
+    )
+    .bind(
+      id,
+      String(task.title),
+      String(task.description || ''),
+      String(task.taskType || 'link'),
+      String(task.targetUrl || ''),
+      toNonNegInt(task.rewardPaise),
+      String(task.createdBy || ''),
+      now,
+      now
+    )
+    .run();
+  return { id, ...task, createdAt: now, updatedAt: now };
+}
+
+export async function completeUserTaskTransaction(env, { taskId, userId, rewardPaise, completedAt = Date.now() }) {
+  const db = assertDB(env);
+  const uid = String(userId);
+  const tid = String(taskId);
+  const safeReward = toNonNegInt(rewardPaise);
+  const userTaskId = generateId('UTSK');
+  const ledgerId = generateId('LDG');
+
+  const statements = [
+    db
+      .prepare(
+        `INSERT INTO user_tasks (id, task_id, user_id, status, reward_paise, completed_at, rewarded_at)
+         VALUES (?, ?, ?, 'completed', ?, ?, ?)`
+      )
+      .bind(userTaskId, tid, uid, safeReward, completedAt, safeReward > 0 ? completedAt : null),
+  ];
+
+  if (safeReward > 0) {
+    statements.push(
+      db
+        .prepare(
+          `UPDATE users
+           SET balance_paise = balance_paise + ?,
+               total_earned_paise = total_earned_paise + ?
+           WHERE telegram_id = ?`
+        )
+        .bind(safeReward, safeReward, uid),
+      db
+        .prepare(
+          `INSERT INTO ledger (
+            id, user_id, entry_type, direction, amount_paise,
+            balance_before_paise, balance_after_paise,
+            reference_type, reference_id, description, created_at
+          )
+          SELECT ?, telegram_id, 'task_credit', 'credit', ?,
+                 balance_paise - ?, balance_paise,
+                 'task', ?, ?, ?
+          FROM users
+          WHERE telegram_id = ?`
+        )
+        .bind(
+          ledgerId,
+          safeReward,
+          safeReward,
+          `${tid}:${uid}`,
+          `Completed task ${tid}`,
+          completedAt,
+          uid
+        )
+    );
+  }
+
+  try {
+    await db.batch(statements);
+    return { ok: true, userTaskId, user: await getUser(env, uid) };
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('UNIQUE') || msg.includes('CONSTRAINT')) {
+      return { ok: false, duplicate: true, error: 'Task already completed.' };
+    }
+    throw err;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Admin Activity Logs (`activity_logs` table)
 // ----------------------------------------------------------------------------
 
 export async function appendActivityLog(env, entry) {
-  const logs = await kvGetJson(env, 'activity_logs:list', []);
-  logs.unshift(entry);
-  // Retain latest 500 activity log entries in KV
-  await kvPutJson(env, 'activity_logs:list', logs.slice(0, 500));
-  return entry;
+  const db = assertDB(env);
+  const id = String(entry.id || generateId('LOG'));
+  const createdAt = toInt(entry.timestamp, Date.now());
+  await db
+    .prepare(
+      `INSERT INTO activity_logs (id, admin_id, action, details, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+    .bind(id, String(entry.adminId), String(entry.action), String(entry.details || '').slice(0, 500), createdAt)
+    .run();
+  return { ...entry, id, timestamp: createdAt };
 }
 
 export async function getActivityLogsPage(env, page = 1, pageSize = 8) {
-  const logs = await kvGetJson(env, 'activity_logs:list', []);
-  const total = logs.length;
+  const db = assertDB(env);
+  const countRow = await db.prepare('SELECT COUNT(*) AS total FROM activity_logs').first();
+  const total = toNonNegInt(countRow?.total);
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const safePage = Math.min(Math.max(1, Number(page) || 1), totalPages);
-  const start = (safePage - 1) * pageSize;
+  const offset = (safePage - 1) * pageSize;
+
+  const res = await db
+    .prepare('SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT ? OFFSET ?')
+    .bind(pageSize, offset)
+    .all();
+
   return {
-    logs: logs.slice(start, start + pageSize),
+    logs: (res.results || []).map(mapActivityLogRow),
     page: safePage,
     pageSize,
     total,
@@ -754,53 +2050,576 @@ export async function getActivityLogsPage(env, page = 1, pageSize = 8) {
 }
 
 // ----------------------------------------------------------------------------
-// Broadcast Data Collection
+// Broadcast Records (`broadcasts` table)
 // ----------------------------------------------------------------------------
 
 export async function saveBroadcastRecord(env, record) {
-  await kvPutJson(env, `broadcast:${record.id}`, record);
-  const history = await kvGetJson(env, 'broadcast:index', []);
-  if (!history.includes(record.id)) {
-    history.unshift(record.id);
-    await kvPutJson(env, 'broadcast:index', history.slice(0, 50));
-  }
+  const db = assertDB(env);
+  await db
+    .prepare(
+      `INSERT INTO broadcasts (
+        id, admin_id, source_chat_id, source_message_id, media_type, preview_summary,
+        total_recipients, skipped_blocked, sent_count, failed_count, newly_blocked_count,
+        status, created_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        total_recipients = excluded.total_recipients,
+        skipped_blocked = excluded.skipped_blocked,
+        sent_count = excluded.sent_count,
+        failed_count = excluded.failed_count,
+        newly_blocked_count = excluded.newly_blocked_count,
+        status = excluded.status,
+        completed_at = excluded.completed_at`
+    )
+    .bind(
+      String(record.id),
+      String(record.adminId),
+      String(record.sourceChatId),
+      toInt(record.sourceMessageId),
+      String(record.mediaType || 'text'),
+      String(record.previewSummary || ''),
+      toNonNegInt(record.totalRecipients),
+      toNonNegInt(record.skippedBlocked),
+      toNonNegInt(record.sentCount),
+      toNonNegInt(record.failedCount),
+      toNonNegInt(record.newlyBlockedCount),
+      String(record.status || 'draft'),
+      toInt(record.createdAt, Date.now()),
+      record.completedAt !== null && record.completedAt !== undefined
+        ? toInt(record.completedAt)
+        : null
+    )
+    .run();
+
   return record;
 }
 
 export async function getBroadcastRecord(env, id) {
-  return kvGetJson(env, `broadcast:${id}`, null);
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT * FROM broadcasts WHERE id = ?')
+    .bind(String(id))
+    .first();
+  return mapBroadcastRow(row);
 }
 
 // ----------------------------------------------------------------------------
-// Global Statistics Counters
+// Live Global Statistics (Computed directly from D1 SQL tables — single source of truth)
 // ----------------------------------------------------------------------------
 
-const DEFAULT_STATS = {
-  totalReferrals: 0,
-  totalReferralRewardsPaise: 0,
-  totalDailyBonusesCount: 0,
-  totalDailyBonusPaise: 0,
-  totalApprovedWithdrawals: 0,
-  totalRejectedWithdrawals: 0,
-  totalWithdrawnPaise: 0,
-  totalVouchersDelivered: 0,
-};
-
 export async function getGlobalStats(env) {
-  const stored = await kvGetJson(env, 'stats:global', null);
+  const db = assertDB(env);
+  const [refRow, dailyRow, wdRow, vhRow] = await db.batch([
+    db.prepare(
+      'SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_paise), 0) AS sum_paise FROM referrals'
+    ),
+    db.prepare(
+      'SELECT COUNT(*) AS cnt, COALESCE(SUM(amount_paise), 0) AS sum_paise FROM daily_claims'
+    ),
+    db.prepare(
+      `SELECT
+        SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved_cnt,
+        SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected_cnt,
+        COALESCE(SUM(CASE WHEN status = 'approved' THEN amount_paise ELSE 0 END), 0) AS withdrawn_paise
+       FROM withdrawals`
+    ),
+    db.prepare('SELECT COUNT(*) AS cnt FROM voucher_history'),
+  ]);
+
+  const ref = refRow?.results?.[0] || {};
+  const daily = dailyRow?.results?.[0] || {};
+  const wd = wdRow?.results?.[0] || {};
+  const vh = vhRow?.results?.[0] || {};
+
   return {
-    ...DEFAULT_STATS,
-    ...(stored || {}),
+    totalReferrals: toNonNegInt(ref.cnt),
+    totalReferralRewardsPaise: toNonNegInt(ref.sum_paise),
+    totalDailyBonusesCount: toNonNegInt(daily.cnt),
+    totalDailyBonusPaise: toNonNegInt(daily.sum_paise),
+    totalApprovedWithdrawals: toNonNegInt(wd.approved_cnt),
+    totalRejectedWithdrawals: toNonNegInt(wd.rejected_cnt),
+    totalWithdrawnPaise: toNonNegInt(wd.withdrawn_paise),
+    totalVouchersDelivered: toNonNegInt(vh.cnt),
   };
 }
 
-export async function incrementGlobalStats(env, deltas) {
-  const current = await getGlobalStats(env);
-  for (const [key, value] of Object.entries(deltas)) {
-    if (key in current) {
-      current[key] = Math.max(0, Math.round(Number(current[key] || 0) + Number(value || 0)));
-    }
-  }
-  await kvPutJson(env, 'stats:global', current);
-  return current;
+// ----------------------------------------------------------------------------
+// Manual Admin Balance Adjustments (`balance_adjustments` + `users` + `ledger`)
+// ----------------------------------------------------------------------------
+
+function mapBalanceAdjustmentRow(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    adminId: String(row.admin_id),
+    targetUserId: String(row.target_user_id),
+    action: String(row.action),
+    amountPaise: toNonNegInt(row.amount_paise),
+    balanceBeforePaise: toNonNegInt(row.balance_before_paise),
+    balanceAfterPaise: toNonNegInt(row.balance_after_paise),
+    reason: row.reason || '',
+    createdAt: toInt(row.created_at),
+  };
 }
+
+export async function getBalanceAdjustmentById(env, operationId) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT * FROM balance_adjustments WHERE id = ?')
+    .bind(String(operationId))
+    .first();
+  return mapBalanceAdjustmentRow(row);
+}
+
+export async function getUserBalanceAdjustments(env, telegramId, limit = 20) {
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `SELECT * FROM balance_adjustments
+       WHERE target_user_id = ?
+       ORDER BY created_at DESC
+       LIMIT ?`
+    )
+    .bind(String(telegramId), Math.max(1, toInt(limit, 20)))
+    .all();
+  return (res.results || []).map(mapBalanceAdjustmentRow);
+}
+
+/**
+ * Atomically add or deduct a user's balance inside ONE Cloudflare D1 batch:
+ *   1. UPDATE users (enforcing CHECK balance_paise >= 0 on DEDUCT)
+ *   2. INSERT INTO balance_adjustments (PRIMARY KEY operationId prevents duplicate execution)
+ *   3. INSERT INTO ledger (immutable audit entry with UNIQUE reference)
+ */
+export async function executeManualBalanceAdjustmentTransaction(
+  env,
+  { operationId, adminId, targetUserId, action, amountPaise, reason = '', createdAt = Date.now() }
+) {
+  const db = assertDB(env);
+  const opId = String(operationId || '').trim();
+  const aid = String(adminId || '').trim();
+  const uid = String(targetUserId || '').trim();
+  const act = String(action || '').toUpperCase();
+  const safeAmount = Math.round(Number(amountPaise));
+  const cleanReason = String(reason || '').trim().slice(0, 250);
+
+  if (!opId) {
+    return { ok: false, error: 'Missing operation ID.' };
+  }
+  if (act !== 'ADD' && act !== 'DEDUCT') {
+    return { ok: false, error: 'Invalid balance action. Expected ADD or DEDUCT.' };
+  }
+  if (
+    !Number.isSafeInteger(safeAmount) ||
+    safeAmount <= 0 ||
+    safeAmount > MAX_MANUAL_BALANCE_ADJUSTMENT_PAISE
+  ) {
+    return { ok: false, error: 'Invalid balance adjustment amount.' };
+  }
+
+  const targetUser = await getUser(env, uid);
+  if (!targetUser) {
+    return { ok: false, notFound: true, error: 'Target user not found.' };
+  }
+  if (act === 'DEDUCT' && targetUser.balancePaise < safeAmount) {
+    return {
+      ok: false,
+      insufficientBalance: true,
+      error: 'Insufficient user balance: negative balance is not allowed.',
+    };
+  }
+
+  const ledgerId = generateId('LDG');
+  const ledgerDesc = cleanReason
+    ? `Admin ${act === 'ADD' ? 'credit' : 'deduction'} (${aid}): ${cleanReason}`
+    : `Admin ${act === 'ADD' ? 'credit' : 'deduction'} (${aid})`;
+
+  const statements =
+    act === 'ADD'
+      ? [
+          db
+            .prepare(
+              `UPDATE users
+               SET balance_paise = balance_paise + ?,
+                   total_earned_paise = total_earned_paise + ?
+               WHERE telegram_id = ?`
+            )
+            .bind(safeAmount, safeAmount, uid),
+          db
+            .prepare(
+              `INSERT INTO balance_adjustments (
+                id, admin_id, target_user_id, action, amount_paise,
+                balance_before_paise, balance_after_paise, reason, created_at
+              )
+              SELECT ?, ?, telegram_id, 'ADD', ?, balance_paise - ?, balance_paise, ?, ?
+              FROM users
+              WHERE telegram_id = ?`
+            )
+            .bind(opId, aid, safeAmount, safeAmount, cleanReason, createdAt, uid),
+          db
+            .prepare(
+              `INSERT INTO ledger (
+                id, user_id, entry_type, direction, amount_paise,
+                balance_before_paise, balance_after_paise,
+                reference_type, reference_id, description, created_at
+              )
+              SELECT ?, telegram_id, 'admin_balance_add', 'credit', ?,
+                     balance_paise - ?, balance_paise,
+                     'balance_adjustment', ?, ?, ?
+              FROM users
+              WHERE telegram_id = ?`
+            )
+            .bind(ledgerId, safeAmount, safeAmount, opId, ledgerDesc, createdAt, uid),
+        ]
+      : [
+          db
+            .prepare(
+              `UPDATE users
+               SET balance_paise = balance_paise - ?
+               WHERE telegram_id = ?`
+            )
+            .bind(safeAmount, uid),
+          db
+            .prepare(
+              `INSERT INTO balance_adjustments (
+                id, admin_id, target_user_id, action, amount_paise,
+                balance_before_paise, balance_after_paise, reason, created_at
+              )
+              SELECT ?, ?, telegram_id, 'DEDUCT', ?, balance_paise + ?, balance_paise, ?, ?
+              FROM users
+              WHERE telegram_id = ?`
+            )
+            .bind(opId, aid, safeAmount, safeAmount, cleanReason, createdAt, uid),
+          db
+            .prepare(
+              `INSERT INTO ledger (
+                id, user_id, entry_type, direction, amount_paise,
+                balance_before_paise, balance_after_paise,
+                reference_type, reference_id, description, created_at
+              )
+              SELECT ?, telegram_id, 'admin_balance_deduct', 'debit', ?,
+                     balance_paise + ?, balance_paise,
+                     'balance_adjustment', ?, ?, ?
+              FROM users
+              WHERE telegram_id = ?`
+            )
+            .bind(ledgerId, safeAmount, safeAmount, opId, ledgerDesc, createdAt, uid),
+        ];
+
+  try {
+    await db.batch(statements);
+    const [adjustment, updatedUser] = await Promise.all([
+      getBalanceAdjustmentById(env, opId),
+      getUser(env, uid),
+    ]);
+    if (!adjustment) {
+      return { ok: false, error: 'Balance adjustment did not commit.' };
+    }
+    return {
+      ok: true,
+      adjustment,
+      user: updatedUser,
+    };
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('UNIQUE') || msg.includes('PRIMARY KEY')) {
+      return {
+        ok: false,
+        duplicate: true,
+        error: 'Duplicate balance operation rejected: this action was already executed.',
+      };
+    }
+    if (msg.includes('CHECK') || msg.includes('balance_paise')) {
+      return {
+        ok: false,
+        insufficientBalance: true,
+        error: 'Insufficient user balance: negative balance is not allowed.',
+      };
+    }
+    throw err;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Task Approval / Rejection Review (`user_tasks` + atomic reward credit)
+// ----------------------------------------------------------------------------
+
+export async function reviewUserTaskTransaction(
+  env,
+  { userTaskId, status, adminId, reviewNote = '', reviewedAt = Date.now() }
+) {
+  const db = assertDB(env);
+  const utId = String(userTaskId);
+  const targetStatus = status === 'approved' ? 'approved' : 'rejected';
+  const aid = String(adminId);
+  const note = String(reviewNote || '').trim().slice(0, 250);
+
+  const existing = await db
+    .prepare('SELECT * FROM user_tasks WHERE id = ?')
+    .bind(utId)
+    .first();
+  if (!existing) {
+    return { ok: false, error: 'User task submission not found.' };
+  }
+  if (existing.status !== 'pending') {
+    return { ok: false, alreadyReviewed: true, error: `Task submission is already ${existing.status}.` };
+  }
+
+  const rewardPaise = toNonNegInt(existing.reward_paise);
+  const uid = String(existing.user_id);
+  const statements = [
+    db
+      .prepare(
+        `UPDATE user_tasks
+         SET status = ?,
+             rewarded_at = CASE WHEN ? = 'approved' THEN ? ELSE rewarded_at END,
+             reviewed_by = ?,
+             reviewed_at = ?,
+             review_note = ?
+         WHERE id = ? AND status = 'pending'`
+      )
+      .bind(targetStatus, targetStatus, reviewedAt, aid, reviewedAt, note, utId),
+  ];
+
+  if (targetStatus === 'approved' && rewardPaise > 0) {
+    const ledgerId = generateId('LDG');
+    statements.push(
+      db
+        .prepare(
+          `UPDATE users
+           SET balance_paise = balance_paise + ?,
+               total_earned_paise = total_earned_paise + ?
+           WHERE telegram_id = ?`
+        )
+        .bind(rewardPaise, rewardPaise, uid),
+      db
+        .prepare(
+          `INSERT INTO ledger (
+            id, user_id, entry_type, direction, amount_paise,
+            balance_before_paise, balance_after_paise,
+            reference_type, reference_id, description, created_at
+          )
+          SELECT ?, telegram_id, 'task_credit', 'credit', ?,
+                 balance_paise - ?, balance_paise,
+                 'task_approval', ?, ?, ?
+          FROM users
+          WHERE telegram_id = ?`
+        )
+        .bind(
+          ledgerId,
+          rewardPaise,
+          rewardPaise,
+          utId,
+          `Approved task ${existing.task_id}`,
+          reviewedAt,
+          uid
+        )
+    );
+  }
+
+  await db.batch(statements);
+  return {
+    ok: true,
+    userTask: {
+      id: utId,
+      taskId: String(existing.task_id),
+      userId: uid,
+      status: targetStatus,
+      rewardPaise,
+      reviewedBy: aid,
+      reviewedAt,
+      reviewNote: note,
+    },
+    user: await getUser(env, uid),
+  };
+}
+
+// ----------------------------------------------------------------------------
+// Secretary Mode Config & Delivery Log Storage (`settings`, `secretary_logs`)
+// ----------------------------------------------------------------------------
+
+const SECRETARY_CONFIG_KEY = 'secretary_config';
+
+export async function getSecretaryConfig(env) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT value_json FROM settings WHERE key = ?')
+    .bind(SECRETARY_CONFIG_KEY)
+    .first();
+  const saved = safeJsonParse(row?.value_json, {}) || {};
+  const envChannel = getConfiguredLogChannelId(env);
+
+  return {
+    enabled: Boolean(saved.enabled),
+    manuallyDisabled: Boolean(saved.manuallyDisabled),
+    channelInput: String(saved.channelInput || envChannel || '').trim(),
+    resolvedChatId: String(saved.resolvedChatId || '').trim(),
+    channelTitle: String(saved.channelTitle || 'PnA X Logs'),
+    channelUsername: String(saved.channelUsername || '').trim(),
+    verifiedAdmin: Boolean(saved.verifiedAdmin),
+    verifiedAt: saved.verifiedAt ? toInt(saved.verifiedAt) : null,
+    lastVerifyAttemptAt: saved.lastVerifyAttemptAt ? toInt(saved.lastVerifyAttemptAt) : null,
+    lastError: String(saved.lastError || ''),
+  };
+}
+
+export async function saveSecretaryConfig(env, patch) {
+  const db = assertDB(env);
+  const current = await getSecretaryConfig(env);
+  const merged = {
+    ...current,
+    ...patch,
+  };
+  const now = Date.now();
+  await db
+    .prepare(
+      `INSERT INTO settings (key, value_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         value_json = excluded.value_json,
+         updated_at = excluded.updated_at`
+    )
+    .bind(SECRETARY_CONFIG_KEY, JSON.stringify(merged), now)
+    .run();
+  return merged;
+}
+
+export async function claimSecretaryLogEntry(
+  env,
+  { id, dedupKey, eventType, channelId = '', messageText, createdAt = Date.now() }
+) {
+  const db = assertDB(env);
+  const logId = String(id || generateId('SEC'));
+  const dKey = String(dedupKey);
+  const res = await db
+    .prepare(
+      `INSERT OR IGNORE INTO secretary_logs (
+        id, dedup_key, event_type, channel_id, message_text,
+        status, attempts, last_error, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'pending', 0, '', ?, ?)`
+    )
+    .bind(logId, dKey, String(eventType), String(channelId), String(messageText), createdAt, createdAt)
+    .run();
+
+  if (Number(res?.meta?.changes ?? 0) > 0) {
+    return { claimed: true, id: logId, existingStatus: null };
+  }
+
+  const existing = await db
+    .prepare('SELECT id, status FROM secretary_logs WHERE dedup_key = ?')
+    .bind(dKey)
+    .first();
+  return {
+    claimed: false,
+    id: existing ? String(existing.id) : logId,
+    existingStatus: existing ? String(existing.status) : 'unknown',
+  };
+}
+
+export async function markSecretaryLogSent(
+  env,
+  logId,
+  { channelId = '', telegramMessageId = null, sentAt = Date.now() } = {}
+) {
+  const db = assertDB(env);
+  await db
+    .prepare(
+      `UPDATE secretary_logs
+       SET status = 'sent',
+           channel_id = CASE WHEN ? <> '' THEN ? ELSE channel_id END,
+           attempts = attempts + 1,
+           telegram_message_id = ?,
+           last_error = '',
+           sent_at = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(String(channelId), String(channelId), telegramMessageId, sentAt, sentAt, String(logId))
+    .run();
+}
+
+export async function markSecretaryLogFailed(
+  env,
+  logId,
+  { channelId = '', errorMessage = 'Delivery failed', now = Date.now() } = {}
+) {
+  const db = assertDB(env);
+  await db
+    .prepare(
+      `UPDATE secretary_logs
+       SET status = 'failed',
+           channel_id = CASE WHEN ? <> '' THEN ? ELSE channel_id END,
+           attempts = attempts + 1,
+           last_error = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(
+      String(channelId),
+      String(channelId),
+      String(errorMessage || 'Delivery failed').slice(0, 400),
+      now,
+      String(logId)
+    )
+    .run();
+}
+
+export async function markSecretaryLogSkipped(env, logId, reason = 'Secretary Mode disabled') {
+  const db = assertDB(env);
+  const now = Date.now();
+  await db
+    .prepare(
+      `UPDATE secretary_logs
+       SET status = 'skipped',
+           last_error = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(String(reason || '').slice(0, 300), now, String(logId))
+    .run();
+}
+
+export async function getFailedSecretaryLogs(env, limit = 10) {
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `SELECT * FROM secretary_logs
+       WHERE status = 'failed'
+       ORDER BY created_at ASC
+       LIMIT ?`
+    )
+    .bind(Math.max(1, toInt(limit, 10)))
+    .all();
+  return (res.results || []).map((row) => ({
+    id: String(row.id),
+    dedupKey: String(row.dedup_key),
+    eventType: String(row.event_type),
+    channelId: row.channel_id || '',
+    messageText: row.message_text || '',
+    status: String(row.status),
+    attempts: toNonNegInt(row.attempts),
+    lastError: row.last_error || '',
+    createdAt: toInt(row.created_at),
+  }));
+}
+
+export async function getSecretaryLogStats(env) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare(
+      `SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent_cnt,
+        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_cnt,
+        SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped_cnt
+       FROM secretary_logs`
+    )
+    .first();
+  return {
+    total: toNonNegInt(row?.total),
+    sent: toNonNegInt(row?.sent_cnt),
+    failed: toNonNegInt(row?.failed_cnt),
+    skipped: toNonNegInt(row?.skipped_cnt),
+  };
+}
+

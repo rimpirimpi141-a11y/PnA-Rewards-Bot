@@ -95,7 +95,7 @@ export function matchesConfiguredChannel(channel, incomingChat) {
 
 /**
  * Handle incoming Telegram `chat_join_request` update.
- * Records the pending join request in KV for status feedback ONLY.
+ * Records the pending join request in D1 for status feedback ONLY.
  * CRITICAL: NEVER marks the user as joined and NEVER grants bot access here!
  */
 export async function handleIncomingJoinRequest(env, chatJoinRequest) {

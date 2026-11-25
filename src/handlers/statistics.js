@@ -6,9 +6,9 @@ import { DIVIDER, buildHeader } from '../animations.js';
 import { BOT_BRAND, formatINR, formatIST } from '../config.js';
 import {
   countActiveUsers,
+  countPendingWithdrawals,
   getAllCategoryStockSummary,
   getGlobalStats,
-  getPendingWithdrawalIds,
   getSettings,
   hasAdminPermission,
 } from '../database.js';
@@ -24,11 +24,11 @@ export async function handleAdminStatistics(env, adminId, chatId, messageId = nu
     return;
   }
 
-  const [userCounts, stats, stock, pendingIds, settings] = await Promise.all([
+  const [userCounts, stats, stock, pendingCount, settings] = await Promise.all([
     countActiveUsers(env),
     getGlobalStats(env),
     getAllCategoryStockSummary(env),
-    getPendingWithdrawalIds(env),
+    countPendingWithdrawals(env),
     getSettings(env),
   ]);
 
@@ -48,7 +48,7 @@ export async function handleAdminStatistics(env, adminId, chatId, messageId = nu
     `• Total Daily Bonuses: <b>${stats.totalDailyBonusesCount}</b> (${formatINR(stats.totalDailyBonusPaise)})\n` +
     `${DIVIDER}\n` +
     `💸 <b>Withdrawals</b>\n` +
-    `• Pending Withdrawals: <b>${pendingIds.length}</b>\n` +
+    `• Pending Withdrawals: <b>${pendingCount}</b>\n` +
     `• Approved Withdrawals: <b>${stats.totalApprovedWithdrawals}</b> (${formatINR(stats.totalWithdrawnPaise)})\n` +
     `• Rejected Withdrawals: <b>${stats.totalRejectedWithdrawals}</b>\n` +
     `${DIVIDER}\n` +

@@ -35,17 +35,21 @@ export const VOUCHER_CATEGORIES = {
 
 export const VOUCHER_CATEGORY_LIST = Object.values(VOUCHER_CATEGORIES);
 
+export const MAX_MANUAL_BALANCE_ADJUSTMENT_PAISE = 10000000; // ₹1,00,000.00 safety cap per adjustment
+
 export const DEFAULT_ADMIN_PERMISSIONS = {
   manageVouchers: true,
   approveWithdrawals: true,
   manageForceChannels: true,
   manageSettings: true,
+  manageBalances: true,
   viewUsers: true,
   viewStats: true,
   broadcast: true,
   manageLowStock: true,
   manageMaintenance: true,
   viewLogs: true,
+  manageSecretary: false, // Owner-only configuration
   manageAdmins: false, // Strictly Owner-only
 };
 
@@ -54,12 +58,14 @@ export const OWNER_PERMISSIONS = {
   approveWithdrawals: true,
   manageForceChannels: true,
   manageSettings: true,
+  manageBalances: true,
   viewUsers: true,
   viewStats: true,
   broadcast: true,
   manageLowStock: true,
   manageMaintenance: true,
   viewLogs: true,
+  manageSecretary: true,
   manageAdmins: true,
 };
 
@@ -109,6 +115,8 @@ export const MENU_BUTTONS = {
 export const ADMIN_BUTTONS = {
   ADD_VOUCHER: '➕ Add Voucher',
   PENDING_REQUESTS: '📋 Pending Requests',
+  MANAGE_BALANCE: '💰 Manage User Balance',
+  SECRETARY_MODE: '📡 Secretary Mode',
   FORCE_CHANNELS: '📢 Force Channels',
   SETTINGS: '⚙️ Settings',
   USERS_LIST: '👥 Users List',
@@ -127,6 +135,9 @@ export const ACTIVITY_ACTIONS = {
   VOUCHER_DISABLED: 'VOUCHER_DISABLED',
   WITHDRAWAL_APPROVED: 'WITHDRAWAL_APPROVED',
   WITHDRAWAL_REJECTED: 'WITHDRAWAL_REJECTED',
+  BALANCE_ADDED: 'BALANCE_ADDED',
+  BALANCE_DEDUCTED: 'BALANCE_DEDUCTED',
+  SECRETARY_CONFIG_CHANGED: 'SECRETARY_CONFIG_CHANGED',
   FORCE_CHANNEL_ADDED: 'FORCE_CHANNEL_ADDED',
   FORCE_CHANNEL_REMOVED: 'FORCE_CHANNEL_REMOVED',
   ADMIN_ADDED: 'ADMIN_ADDED',
@@ -140,6 +151,8 @@ export const ACTIVITY_ACTIONS = {
   MAINTENANCE_DISABLED: 'MAINTENANCE_DISABLED',
   BROADCAST_SENT: 'BROADCAST_SENT',
   USER_STATUS_CHANGED: 'USER_STATUS_CHANGED',
+  TASK_CREATED: 'TASK_CREATED',
+  TASK_REVIEWED: 'TASK_REVIEWED',
 };
 
 export function getOwnerId(env) {
@@ -154,6 +167,26 @@ export function getTimezone(env) {
 export function getWebhookPath(env) {
   const raw = env?.WEBHOOK_PATH ? String(env.WEBHOOK_PATH).trim() : DEFAULT_WEBHOOK_PATH;
   return raw.startsWith('/') ? raw : `/${raw}`;
+}
+
+export function getConfiguredLogChannelId(env) {
+  return env?.PNA_LOG_CHANNEL_ID ? String(env.PNA_LOG_CHANNEL_ID).trim() : '';
+}
+
+/**
+ * Parse a strict INR rupees input string (up to 2 decimal places, strictly positive)
+ * into exact integer paise. Rejects scientific notation, negative, zero, or invalid text.
+ */
+export function parseStrictPositiveINR(rawInput) {
+  const cleaned = String(rawInput ?? '').trim().replace(/^₹\s*/, '');
+  if (!/^\d+(\.\d{1,2})?$/.test(cleaned)) return null;
+  const [rupeesStr, paiseStr = ''] = cleaned.split('.');
+  if (rupeesStr.length > 9) return null;
+  const rupees = Number(rupeesStr);
+  const paise = Number(paiseStr.padEnd(2, '0'));
+  const total = rupees * 100 + paise;
+  if (!Number.isSafeInteger(total) || total <= 0) return null;
+  return total;
 }
 
 /**

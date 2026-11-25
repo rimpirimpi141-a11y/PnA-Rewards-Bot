@@ -8,20 +8,16 @@ import {
   formatCountdown,
   formatINR,
   formatIST,
-  generateId,
   getISTDateKey,
 } from '../config.js';
 import {
-  acquireLock,
-  addDailyBonusClaim,
+  executeDailyBonusClaimTransaction,
   getDailyBonusHistory,
   getSettings,
   getUser,
-  incrementGlobalStats,
-  releaseLock,
 } from '../database.js';
 import { dailyBonusInlineKeyboard } from '../keyboards.js';
-import { creditDailyBonus } from '../services/balance.js';
+import { logDailyBonusClaimedEvent } from '../services/secretary.js';
 import { answerCallbackQuery, editOrSend } from '../telegram.js';
 import { ensureUserAccess } from './start.js';
 
@@ -69,7 +65,8 @@ export async function handleDailyBonusView(env, tgUser, chatId, messageId = null
 }
 
 /**
- * Handle `bonus:claim` callback with KV lock to prevent double claims.
+ * Handle `bonus:claim` callback with atomic D1 transaction & database-enforced
+ * 24-hour / per-IST-day anti-duplicate protection.
  */
 export async function handleDailyBonusClaimCallback(env, callbackQuery) {
   const tgUser = callbackQuery.from;
@@ -82,68 +79,65 @@ export async function handleDailyBonusClaimCallback(env, callbackQuery) {
     return;
   }
 
-  const lockScope = `daily_claim:${access.user.id}`;
-  const lockToken = await acquireLock(env, lockScope, 60);
-  if (!lockToken) {
-    await answerCallbackQuery(env, callbackQuery.id, '⏳ Claim already processing...', true);
-    return;
-  }
-
-  try {
-    // Re-read fresh user under lock
-    const freshUser = await getUser(env, access.user.id);
-    const elig = getDailyEligibility(freshUser);
-    if (!elig.canClaim) {
-      await answerCallbackQuery(
-        env,
-        callbackQuery.id,
-        `⏳ Next claim in ${formatCountdown(elig.remainingMs)}`,
-        true
-      );
-      await handleDailyBonusView(env, tgUser, chatId, msgId);
-      return;
-    }
-
-    const settings = await getSettings(env);
-    const bonusPaise = Math.max(1, Math.round(Number(settings.dailyBonusPaise || 25)));
-    const now = Date.now();
-
-    const updatedUser = await creditDailyBonus(env, freshUser.id, bonusPaise, now);
-    await addDailyBonusClaim(env, freshUser.id, {
-      id: generateId('DBN'),
-      amountPaise: bonusPaise,
-      claimedAt: now,
-      istDate: getISTDateKey(now, env),
-    });
-
-    await incrementGlobalStats(env, {
-      totalDailyBonusesCount: 1,
-      totalDailyBonusPaise: bonusPaise,
-    });
-
+  const freshUser = await getUser(env, access.user.id);
+  const elig = getDailyEligibility(freshUser);
+  if (!elig.canClaim) {
     await answerCallbackQuery(
       env,
       callbackQuery.id,
-      `🎉 Claimed ${formatINR(bonusPaise)} Daily Bonus!`,
+      `⏳ Next claim in ${formatCountdown(elig.remainingMs)}`,
       true
     );
-
-    const nextAt = now + DAY_MS;
-    const text =
-      `${buildHeader('🎉', 'DAILY BONUS CLAIMED!')}\n` +
-      `💰 <b>Credited Amount:</b> <b>+${formatINR(bonusPaise)}</b>\n` +
-      `🏦 <b>New Available Balance:</b> <b>${formatINR(updatedUser.balancePaise)}</b>\n` +
-      `🕒 <b>Claimed At:</b> ${formatIST(now, env)}\n` +
-      `${DIVIDER}\n` +
-      `⏳ <b>Next Claim Available In:</b> <b>${formatCountdown(DAY_MS)}</b>\n` +
-      `📅 <b>Next Eligible Time:</b> ${formatIST(nextAt, env)}`;
-
-    await editOrSend(env, chatId, msgId, text, {
-      reply_markup: dailyBonusInlineKeyboard(false),
-    });
-  } finally {
-    await releaseLock(env, lockScope, lockToken);
+    await handleDailyBonusView(env, tgUser, chatId, msgId);
+    return;
   }
+
+  const settings = await getSettings(env);
+  const bonusPaise = Math.max(1, Math.round(Number(settings.dailyBonusPaise || 25)));
+  const now = Date.now();
+  const istDate = getISTDateKey(now, env);
+
+  const tx = await executeDailyBonusClaimTransaction(env, {
+    userId: freshUser.id,
+    amountPaise: bonusPaise,
+    istDate,
+    claimedAt: now,
+  });
+
+  if (!tx.ok) {
+    const latestUser = await getUser(env, freshUser.id);
+    const latestElig = getDailyEligibility(latestUser);
+    const waitMsg = latestElig.remainingMs > 0
+      ? `⏳ Already claimed! Next claim in ${formatCountdown(latestElig.remainingMs)}`
+      : '⏳ Daily bonus already claimed for today (IST).';
+    await answerCallbackQuery(env, callbackQuery.id, waitMsg, true);
+    await handleDailyBonusView(env, tgUser, chatId, msgId);
+    return;
+  }
+
+  const updatedUser = tx.user;
+  await logDailyBonusClaimedEvent(env, { user: updatedUser, claim: tx.claim });
+
+  await answerCallbackQuery(
+    env,
+    callbackQuery.id,
+    `🎉 Claimed ${formatINR(bonusPaise)} Daily Bonus!`,
+    true
+  );
+
+  const nextAt = now + DAY_MS;
+  const text =
+    `${buildHeader('🎉', 'DAILY BONUS CLAIMED!')}\n` +
+    `💰 <b>Credited Amount:</b> <b>+${formatINR(bonusPaise)}</b>\n` +
+    `🏦 <b>New Available Balance:</b> <b>${formatINR(updatedUser.balancePaise)}</b>\n` +
+    `🕒 <b>Claimed At:</b> ${formatIST(now, env)}\n` +
+    `${DIVIDER}\n` +
+    `⏳ <b>Next Claim Available In:</b> <b>${formatCountdown(DAY_MS)}</b>\n` +
+    `📅 <b>Next Eligible Time:</b> ${formatIST(nextAt, env)}`;
+
+  await editOrSend(env, chatId, msgId, text, {
+    reply_markup: dailyBonusInlineKeyboard(false),
+  });
 }
 
 /**

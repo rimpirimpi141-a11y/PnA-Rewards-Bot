@@ -11,10 +11,11 @@ import {
 } from '../config.js';
 import {
   clearUserState,
+  deleteForceChannel,
   getForceChannels,
   hasAdminPermission,
-  saveForceChannels,
   setUserState,
+  upsertForceChannel,
 } from '../database.js';
 import {
   adminActionKeyboard,
@@ -23,6 +24,7 @@ import {
 } from '../keyboards.js';
 import { logAdminActivity } from '../services/activity-log.js';
 import { inspectChannelForAdmin, resolveChannelTarget } from '../services/membership.js';
+import { logForceChannelChangeEvent } from '../services/secretary.js';
 import { answerCallbackQuery, editOrSend, sendMessage } from '../telegram.js';
 
 /**
@@ -275,11 +277,8 @@ export async function handleAdminForceChannelLinkInput(env, message, state) {
     return;
   }
 
-  const channels = await getForceChannels(env);
-  const existingIdx = channels.findIndex((c) => String(c.chatId) === String(state.chatId));
-
-  const newChannel = {
-    id: existingIdx >= 0 ? channels[existingIdx].id : generateId('FJ'),
+  const newChannel = await upsertForceChannel(env, {
+    id: generateId('FJ'),
     chatId: String(state.chatId),
     username: String(state.username || ''),
     title: String(state.title || state.chatId),
@@ -288,15 +287,8 @@ export async function handleAdminForceChannelLinkInput(env, message, state) {
     isRequestToJoin: Boolean(state.isRequestToJoin),
     addedBy: String(adminId),
     addedAt: Date.now(),
-  };
+  });
 
-  if (existingIdx >= 0) {
-    channels[existingIdx] = newChannel;
-  } else {
-    channels.push(newChannel);
-  }
-
-  await saveForceChannels(env, channels);
   await clearUserState(env, adminId);
 
   await logAdminActivity(
@@ -305,6 +297,7 @@ export async function handleAdminForceChannelLinkInput(env, message, state) {
     ACTIVITY_ACTIONS.FORCE_CHANNEL_ADDED,
     `Saved force-join channel "${newChannel.title}" (${newChannel.chatId}, ${newChannel.isRequestToJoin ? 'Request-to-Join' : 'Normal'}) -> ${newChannel.inviteLink}`
   );
+  await logForceChannelChangeEvent(env, { adminId, action: 'ADDED', channel: newChannel });
 
   const modeLabel = newChannel.isRequestToJoin
     ? '🔐 Request-to-Join (Admin Approval Required)'
@@ -338,16 +331,12 @@ export async function handleAdminForceChannelDelete(env, callbackQuery, channelI
     return;
   }
 
-  const channels = await getForceChannels(env);
-  const target = channels.find((c) => c.id === channelId);
+  const target = await deleteForceChannel(env, channelId);
   if (!target) {
     await answerCallbackQuery(env, callbackQuery.id, 'Channel already removed.', true);
     await handleAdminForceChannelsMenu(env, adminId, chatId, msgId);
     return;
   }
-
-  const updated = channels.filter((c) => c.id !== channelId);
-  await saveForceChannels(env, updated);
 
   await logAdminActivity(
     env,
@@ -355,6 +344,7 @@ export async function handleAdminForceChannelDelete(env, callbackQuery, channelI
     ACTIVITY_ACTIONS.FORCE_CHANNEL_REMOVED,
     `Removed force-join channel "${target.title}" (${target.chatId})`
   );
+  await logForceChannelChangeEvent(env, { adminId, action: 'REMOVED', channel: target });
 
   await answerCallbackQuery(env, callbackQuery.id, `🗑️ Removed ${target.title}`, true);
   await handleAdminForceChannelsMenu(env, adminId, chatId, msgId);

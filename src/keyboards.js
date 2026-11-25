@@ -73,6 +73,10 @@ export function adminReplyKeyboard() {
         { text: ADMIN_BUTTONS.PENDING_REQUESTS, style: PRIMARY },
       ],
       [
+        { text: ADMIN_BUTTONS.MANAGE_BALANCE, style: SUCCESS },
+        { text: ADMIN_BUTTONS.SECRETARY_MODE, style: PRIMARY },
+      ],
+      [
         { text: ADMIN_BUTTONS.FORCE_CHANNELS, style: SUCCESS },
         { text: ADMIN_BUTTONS.SETTINGS, style: PRIMARY },
       ],
@@ -155,7 +159,10 @@ export function forceJoinKeyboard(channels) {
 
 export function balanceInlineKeyboard() {
   return {
-    inline_keyboard: [[{ text: '🎟️ My Vouchers & Withdrawals', callback_data: 'usr:history' }]],
+    inline_keyboard: [
+      [{ text: '📜 Transaction History', callback_data: 'usr:ledger' }],
+      [{ text: '🎟️ My Vouchers & Withdrawals', callback_data: 'usr:history' }],
+    ],
   };
 }
 
@@ -185,7 +192,10 @@ export function dailyBonusInlineKeyboard(canClaim) {
 
 export function profileInlineKeyboard() {
   return {
-    inline_keyboard: [[{ text: '🎟️ My Vouchers & Withdrawals', callback_data: 'usr:history' }]],
+    inline_keyboard: [
+      [{ text: '📜 Transaction History', callback_data: 'usr:ledger' }],
+      [{ text: '🎟️ My Vouchers & Withdrawals', callback_data: 'usr:history' }],
+    ],
   };
 }
 

@@ -15,7 +15,7 @@ import {
   getSettings,
   getUser,
   isAdmin,
-  saveUser,
+  updateUserForceJoinVerified,
 } from '../database.js';
 import { forceJoinKeyboard, mainMenuKeyboard } from '../keyboards.js';
 import { verifyUserForceJoin } from '../services/membership.js';
@@ -23,6 +23,7 @@ import {
   processPendingReferral,
   registerPendingReferralIfEligible,
 } from '../services/referral-service.js';
+import { logNewUserEvent } from '../services/secretary.js';
 import { answerCallbackQuery, editMessageText, sendMessage } from '../telegram.js';
 
 /**
@@ -130,7 +131,7 @@ export async function ensureUserAccess(env, tgUser, chatId) {
   if (!fj.joinedAll) {
     if (user.forceJoinVerified) {
       user.forceJoinVerified = false;
-      await saveUser(env, user);
+      await updateUserForceJoinVerified(env, user.id, false);
     }
     await sendForceJoinPrompt(env, chatId, fj, null, false);
     return { allowed: false, user, isAdminUser: adminUser };
@@ -138,7 +139,7 @@ export async function ensureUserAccess(env, tgUser, chatId) {
 
   if (!user.forceJoinVerified) {
     user.forceJoinVerified = true;
-    await saveUser(env, user);
+    await updateUserForceJoinVerified(env, user.id, true);
   }
 
   return { allowed: true, user, isAdminUser: adminUser };
@@ -170,8 +171,17 @@ export async function handleStartCommand(env, message, startPayload = '') {
   const adminUser = await isAdmin(user.id, env);
 
   // Record referral intent ONLY if genuinely new Telegram user
+  let attributedReferrerId = '';
   if (isNew && startPayload) {
-    await registerPendingReferralIfEligible(env, user, startPayload);
+    const registered = await registerPendingReferralIfEligible(env, user, startPayload);
+    if (registered) {
+      attributedReferrerId = String(startPayload).trim();
+    }
+  }
+
+  // Emit Secretary Mode log for genuinely new users
+  if (isNew) {
+    await logNewUserEvent(env, { user, referrerId: attributedReferrerId });
   }
 
   // Check banned status
@@ -204,7 +214,7 @@ export async function handleStartCommand(env, message, startPayload = '') {
   // User passed force join (or no force-join channels configured)
   if (!user.forceJoinVerified) {
     user.forceJoinVerified = true;
-    await saveUser(env, user);
+    await updateUserForceJoinVerified(env, user.id, true);
   }
 
   // Credit pending referral if eligible
@@ -246,10 +256,9 @@ export async function handleVerifyForceJoinCallback(env, callbackQuery) {
     return;
   }
 
-  // Mark verified
-  const freshUser = (await getUser(env, user.id)) || user;
-  freshUser.forceJoinVerified = true;
-  await saveUser(env, freshUser);
+  // Mark verified without overwriting concurrent fields
+  await updateUserForceJoinVerified(env, user.id, true);
+  const freshUser = (await getUser(env, user.id)) || { ...user, forceJoinVerified: true };
 
   // Credit pending referral immediately upon confirmed membership
   await processPendingReferral(env, freshUser.id);

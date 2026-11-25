@@ -1,27 +1,24 @@
 // ============================================================================
-// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Referral Tracking & Anti-Duplicate Protection Service
+// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Referral Tracking & Anti-Duplicate Protection Service (D1)
 // ============================================================================
 
 import { formatUserName } from '../config.js';
 import {
-  acquireLock,
-  addUserReferral,
+  clearUserPendingReferrer,
+  executeReferralCreditTransaction,
   getCachedBotUsername,
   getReferralClaim,
   getSettings,
   getUser,
-  incrementGlobalStats,
-  releaseLock,
-  saveReferralClaim,
-  saveUser,
   setCachedBotUsername,
+  setUserPendingReferrer,
 } from '../database.js';
 import { getMe } from '../telegram.js';
-import { creditReferralReward } from './balance.js';
 import { notifyReferrerCredited } from './notifications.js';
+import { logReferralCompletedEvent } from './secretary.js';
 
 /**
- * Resolve the bot's Telegram username (from env, KV cache, or getMe).
+ * Resolve the bot's Telegram username (from env, D1 settings cache, or getMe).
  */
 export async function resolveBotUsername(env) {
   const cached = await getCachedBotUsername(env);
@@ -50,9 +47,9 @@ export async function buildReferralLink(env, userId) {
  * Record pending referral intent ONLY for a genuinely brand-new Telegram user.
  * Enforces:
  * - No self-referrals
- * - Referrer must exist in KV
+ * - Referrer must exist in D1 and not be banned
  * - Only genuinely new users can be attributed
- * - One account can only ever be referred once
+ * - One account can only ever be referred once (enforced by referral_claims PK)
  */
 export async function registerPendingReferralIfEligible(env, newUser, rawStartPayload) {
   if (!newUser || !rawStartPayload) return false;
@@ -73,108 +70,82 @@ export async function registerPendingReferralIfEligible(env, newUser, rawStartPa
   const referrer = await getUser(env, referrerId);
   if (!referrer || referrer.status === 'banned') return false;
 
-  newUser.pendingReferrerId = referrerId;
-  await saveUser(env, newUser);
-  return true;
+  return setUserPendingReferrer(env, newUser.id, referrerId);
 }
 
 /**
  * Finalize and credit a pending referral once the new user passes onboarding / force-join.
- * Protected with a per-referred-user lock + permanent ref_claim:<referredId> idempotency key
- * so a Telegram user can NEVER trigger duplicate referral rewards.
+ * Protected atomically by D1 transaction batch + PRIMARY KEY on referral_claims(referred_user_id)
+ * + UNIQUE ledger idempotency so a Telegram user can NEVER trigger duplicate referral rewards.
  */
 export async function processPendingReferral(env, userId) {
   const referredId = String(userId);
-  const lockScope = `ref_process:${referredId}`;
-  const lockToken = await acquireLock(env, lockScope, 60);
-  if (!lockToken) {
-    return { credited: false, reason: 'locked' };
+  const user = await getUser(env, referredId);
+  if (!user || !user.pendingReferrerId) {
+    return { credited: false, reason: 'no_pending_referrer' };
   }
 
-  try {
-    const user = await getUser(env, referredId);
-    if (!user || !user.pendingReferrerId) {
-      return { credited: false, reason: 'no_pending_referrer' };
-    }
+  if (user.referralCredited || user.referredBy) {
+    await clearUserPendingReferrer(env, referredId);
+    return { credited: false, reason: 'already_credited' };
+  }
 
-    if (user.referralCredited || user.referredBy) {
-      return { credited: false, reason: 'already_credited' };
-    }
+  const referrerId = String(user.pendingReferrerId);
+  if (referrerId === referredId) {
+    await clearUserPendingReferrer(env, referredId);
+    return { credited: false, reason: 'self_referral' };
+  }
 
-    const referrerId = String(user.pendingReferrerId);
-    if (referrerId === referredId) {
-      user.pendingReferrerId = null;
-      await saveUser(env, user);
-      return { credited: false, reason: 'self_referral' };
-    }
+  // Permanent idempotency check
+  const existingClaim = await getReferralClaim(env, referredId);
+  if (existingClaim) {
+    await clearUserPendingReferrer(env, referredId);
+    return { credited: false, reason: 'claim_exists' };
+  }
 
-    // Permanent idempotency check
-    const existingClaim = await getReferralClaim(env, referredId);
-    if (existingClaim) {
-      user.referredBy = existingClaim.referrerId;
-      user.pendingReferrerId = null;
-      user.referralCredited = true;
-      await saveUser(env, user);
-      return { credited: false, reason: 'claim_exists' };
-    }
+  const referrer = await getUser(env, referrerId);
+  if (!referrer || referrer.status === 'banned') {
+    await clearUserPendingReferrer(env, referredId);
+    return { credited: false, reason: 'invalid_referrer' };
+  }
 
-    const referrer = await getUser(env, referrerId);
-    if (!referrer || referrer.status === 'banned') {
-      user.pendingReferrerId = null;
-      await saveUser(env, user);
-      return { credited: false, reason: 'invalid_referrer' };
-    }
+  const settings = await getSettings(env);
+  const rewardPaise = Math.max(0, Math.round(Number(settings.referralRewardPaise || 300)));
+  const now = Date.now();
 
-    const settings = await getSettings(env);
-    const rewardPaise = Math.max(0, Math.round(Number(settings.referralRewardPaise || 300)));
-    const now = Date.now();
+  const txResult = await executeReferralCreditTransaction(env, {
+    referrerId,
+    referredUserId: referredId,
+    referredName: formatUserName(user),
+    referredUsername: user.username || '',
+    amountPaise: rewardPaise,
+    creditedAt: now,
+  });
 
-    // 1. Write permanent idempotency claim FIRST
-    const claimRecord = {
+  if (!txResult.ok) {
+    return { credited: false, reason: txResult.duplicate ? 'claim_exists' : 'tx_failed' };
+  }
+
+  // Notify referrer of reward credit & log to PnA X Logs
+  if (txResult.referrer) {
+    await notifyReferrerCredited(
+      env,
       referrerId,
-      referredUserId: referredId,
-      referredName: formatUserName(user),
-      referredUsername: user.username || '',
+      user,
+      rewardPaise,
+      txResult.referrer.balancePaise
+    );
+    await logReferralCompletedEvent(env, {
+      referrer: txResult.referrer,
+      referredUser: user,
       amountPaise: rewardPaise,
       creditedAt: now,
-    };
-    await saveReferralClaim(env, referredId, claimRecord);
-
-    // 2. Mark referred user permanently linked
-    user.referredBy = referrerId;
-    user.pendingReferrerId = null;
-    user.referralCredited = true;
-    await saveUser(env, user);
-
-    // 3. Credit referrer balance & referral count
-    const updatedReferrer = await creditReferralReward(env, referrerId, rewardPaise);
-
-    // 4. Record in referrer's referral list
-    await addUserReferral(env, referrerId, claimRecord);
-
-    // 5. Update global statistics
-    await incrementGlobalStats(env, {
-      totalReferrals: 1,
-      totalReferralRewardsPaise: rewardPaise,
     });
-
-    // 6. Notify referrer of reward credit
-    if (updatedReferrer) {
-      await notifyReferrerCredited(
-        env,
-        referrerId,
-        user,
-        rewardPaise,
-        updatedReferrer.balancePaise
-      );
-    }
-
-    return {
-      credited: true,
-      referrerId,
-      amountPaise: rewardPaise,
-    };
-  } finally {
-    await releaseLock(env, lockScope, lockToken);
   }
+
+  return {
+    credited: true,
+    referrerId,
+    amountPaise: rewardPaise,
+  };
 }

@@ -11,6 +11,9 @@
     "lint": "node scripts/check-syntax.js && tsc --noEmit",
     "webhook:set": "node scripts/set-webhook.js",
     "webhook:info": "node scripts/webhook-info.js",
+    "db:migrate:local": "npx wrangler d1 migrations apply pna-rewards-db --local",
+    "db:migrate:remote": "npx wrangler d1 migrations apply pna-rewards-db --remote",
+    "db:list:remote": "npx wrangler d1 migrations list pna-rewards-db --remote",
     "clean": "rm -rf dist"
   },
   "dependencies": {

@@ -12,9 +12,9 @@ import {
 } from '../config.js';
 import {
   clearUserState,
+  getBroadcastAudienceCounts,
+  getBroadcastEligibleUserIds,
   getBroadcastRecord,
-  getUser,
-  getUserIds,
   hasAdminPermission,
   markUserBlocked,
   saveBroadcastRecord,
@@ -22,6 +22,7 @@ import {
 } from '../database.js';
 import { adminReplyKeyboard, cancelInputKeyboard } from '../keyboards.js';
 import { logAdminActivity } from '../services/activity-log.js';
+import { logBroadcastEvent } from '../services/secretary.js';
 import {
   answerCallbackQuery,
   copyMessage,
@@ -97,22 +98,7 @@ export async function handleAdminBroadcastComposeInput(env, message) {
     return;
   }
 
-  const allUserIds = await getUserIds(env);
-  let eligibleCount = 0;
-  let skippedBlocked = 0;
-
-  for (let i = 0; i < allUserIds.length; i += 50) {
-    const batch = allUserIds.slice(i, i + 50);
-    const records = await Promise.all(batch.map((id) => getUser(env, id)));
-    for (const u of records) {
-      if (!u) continue;
-      if (u.status === 'blocked_bot') {
-        skippedBlocked++;
-      } else {
-        eligibleCount++;
-      }
-    }
-  }
+  const { eligibleCount, skippedBlocked } = await getBroadcastAudienceCounts(env);
 
   const broadcastId = generateId('BC');
   const record = {
@@ -214,6 +200,7 @@ export async function handleAdminBroadcastConfirm(env, callbackQuery, broadcastI
 
   record.status = 'running';
   await saveBroadcastRecord(env, record);
+  await logBroadcastEvent(env, { phase: 'STARTED', record });
   await answerCallbackQuery(env, callbackQuery.id, '🚀 Broadcast started!');
 
   await editMessageText(
@@ -227,19 +214,7 @@ export async function handleAdminBroadcastConfirm(env, callbackQuery, broadcastI
   );
 
   const runJob = async () => {
-    const allUserIds = await getUserIds(env);
-    const recipients = [];
-
-    // Filter out users who previously blocked the bot
-    for (let i = 0; i < allUserIds.length; i += 50) {
-      const batch = allUserIds.slice(i, i + 50);
-      const users = await Promise.all(batch.map((id) => getUser(env, id)));
-      for (const u of users) {
-        if (u && u.status !== 'blocked_bot') {
-          recipients.push(u.id);
-        }
-      }
-    }
+    const recipients = await getBroadcastEligibleUserIds(env);
 
     const total = recipients.length;
     let sent = 0;
@@ -315,6 +290,7 @@ export async function handleAdminBroadcastConfirm(env, callbackQuery, broadcastI
       ACTIVITY_ACTIONS.BROADCAST_SENT,
       `Broadcast ${broadcastId} (${record.mediaType}): ${sent}/${total} delivered, ${failed} failed (${newlyBlocked} newly blocked)`
     );
+    await logBroadcastEvent(env, { phase: 'COMPLETED', record });
 
     await editMessageText(
       env,
