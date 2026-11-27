@@ -78,6 +78,22 @@ function mapUserRow(row) {
     activePendingWithdrawalId: row.active_pending_withdrawal_id || null,
     forceJoinVerified: Boolean(row.force_join_verified),
     withdrawalCount: toNonNegInt(row.withdrawal_count),
+    deviceVerificationStatus: row.device_verification_status
+      ? String(row.device_verification_status)
+      : 'grandfathered',
+    deviceVerifiedAt:
+      row.device_verified_at !== null && row.device_verified_at !== undefined
+        ? toInt(row.device_verified_at)
+        : null,
+    deviceRiskScore: toNonNegInt(row.device_risk_score),
+    deviceFingerprintHash: row.device_fingerprint_hash
+      ? String(row.device_fingerprint_hash)
+      : null,
+    deviceVerificationRequired:
+      row.device_verification_required !== undefined &&
+      row.device_verification_required !== null
+        ? Boolean(row.device_verification_required)
+        : false,
   };
 }
 
@@ -2622,4 +2638,749 @@ export async function getSecretaryLogStats(env) {
     skipped: toNonNegInt(row?.skipped_cnt),
   };
 }
+
+// ============================================================================
+// TELEGRAM MINI APP DEVICE VERIFICATION, CLUSTERS & REFERRAL REVIEWS (D1)
+// ============================================================================
+
+function mapDeviceVerificationRow(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    userId: String(row.user_id),
+    telegramAuthDate: toInt(row.telegram_auth_date),
+    initDataHash: String(row.init_data_hash),
+    strictFpHash: String(row.strict_fp_hash),
+    fuzzyFpHash: String(row.fuzzy_fp_hash),
+    signalHashes: safeJsonParse(row.signal_hashes_json, {}),
+    ipHash: row.ip_hash || '',
+    ipSubnetHash: row.ip_subnet_hash || '',
+    countryCode: row.country_code || '',
+    asn: row.asn || '',
+    asnOrg: row.asn_org || '',
+    proxyVpnFlag: Boolean(row.proxy_vpn_flag),
+    datacenterFlag: Boolean(row.datacenter_flag),
+    riskScore: toNonNegInt(row.risk_score),
+    riskReasons: safeJsonParse(row.risk_reasons_json, []),
+    verdict: String(row.verdict),
+    verifiedTokenJti: row.verified_token_jti || null,
+    createdAt: toInt(row.created_at),
+    updatedAt: toInt(row.updated_at),
+  };
+}
+
+function mapReferralReviewRow(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    referredUserId: String(row.referred_user_id),
+    referrerId: String(row.referrer_id),
+    verificationId: String(row.verification_id),
+    clusterFpHash: row.cluster_fp_hash || '',
+    matchedUserIds: safeJsonParse(row.matched_user_ids_json, []),
+    riskScore: toNonNegInt(row.risk_score),
+    riskReasons: safeJsonParse(row.risk_reasons_json, []),
+    status: String(row.status),
+    reviewedBy: row.reviewed_by ? String(row.reviewed_by) : null,
+    reviewedAt:
+      row.reviewed_at !== null && row.reviewed_at !== undefined
+        ? toInt(row.reviewed_at)
+        : null,
+    reviewNote: row.review_note || '',
+    createdAt: toInt(row.created_at),
+    updatedAt: toInt(row.updated_at),
+  };
+}
+
+export async function createVerificationChallenge(
+  env,
+  { nonceHash, userId, ipHash = '', expiresAt, createdAt = Date.now() }
+) {
+  const db = assertDB(env);
+  await db
+    .prepare(
+      `INSERT INTO verification_challenges (nonce_hash, user_id, ip_hash, expires_at, used_at, created_at)
+       VALUES (?, ?, ?, ?, NULL, ?)`
+    )
+    .bind(String(nonceHash), String(userId), String(ipHash), toInt(expiresAt), toInt(createdAt))
+    .run();
+}
+
+/**
+ * Atomically consume a single-use challenge nonce for the given user if unexpired and unused.
+ */
+export async function consumeVerificationChallenge(env, nonceHash, userId, now = Date.now()) {
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `UPDATE verification_challenges
+       SET used_at = ?
+       WHERE nonce_hash = ?
+         AND user_id = ?
+         AND used_at IS NULL
+         AND expires_at >= ?`
+    )
+    .bind(toInt(now), String(nonceHash), String(userId), toInt(now))
+    .run();
+  return Number(res?.meta?.changes ?? 0) > 0;
+}
+
+export async function countRecentVerificationAttemptsByUser(env, userId, sinceMs) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS cnt FROM device_verifications
+       WHERE user_id = ? AND created_at >= ?`
+    )
+    .bind(String(userId), toInt(sinceMs))
+    .first();
+  return toNonNegInt(row?.cnt);
+}
+
+export async function countRecentDistinctUsersByIp(env, ipHash, sinceMs, excludeUserId) {
+  if (!ipHash) return 0;
+  const db = assertDB(env);
+  const row = await db
+    .prepare(
+      `SELECT COUNT(DISTINCT user_id) AS cnt FROM device_verifications
+       WHERE ip_hash = ? AND created_at >= ? AND user_id <> ?`
+    )
+    .bind(String(ipHash), toInt(sinceMs), String(excludeUserId))
+    .first();
+  return toNonNegInt(row?.cnt);
+}
+
+export async function findOtherUsersByFingerprint(env, fingerprintType, fingerprintHash, excludeUserId) {
+  if (!fingerprintHash) return [];
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `SELECT user_id, first_seen_at, last_seen_at, seen_count
+       FROM device_fingerprint_accounts
+       WHERE fingerprint_type = ? AND fingerprint_hash = ? AND user_id <> ?
+       ORDER BY last_seen_at DESC
+       LIMIT 25`
+    )
+    .bind(String(fingerprintType), String(fingerprintHash), String(excludeUserId))
+    .all();
+  return (res.results || []).map((r) => ({
+    userId: String(r.user_id),
+    firstSeenAt: toInt(r.first_seen_at),
+    lastSeenAt: toInt(r.last_seen_at),
+    seenCount: toNonNegInt(r.seen_count),
+  }));
+}
+
+export async function findOtherUsersByIpSubnet(env, ipSubnetHash, excludeUserId, sinceMs) {
+  if (!ipSubnetHash) return [];
+  const db = assertDB(env);
+  const res = await db
+    .prepare(
+      `SELECT DISTINCT user_id FROM device_verifications
+       WHERE ip_subnet_hash = ? AND user_id <> ? AND created_at >= ?
+       LIMIT 25`
+    )
+    .bind(String(ipSubnetHash), String(excludeUserId), toInt(sinceMs))
+    .all();
+  return (res.results || []).map((r) => String(r.user_id));
+}
+
+export async function getDeviceVerificationByInitDataHash(env, initDataHash) {
+  if (!initDataHash) return null;
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT * FROM device_verifications WHERE init_data_hash = ?')
+    .bind(String(initDataHash))
+    .first();
+  return mapDeviceVerificationRow(row);
+}
+
+export async function getLatestUserDeviceVerification(env, userId) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare(
+      `SELECT * FROM device_verifications
+       WHERE user_id = ?
+       ORDER BY created_at DESC
+       LIMIT 1`
+    )
+    .bind(String(userId))
+    .first();
+  return mapDeviceVerificationRow(row);
+}
+
+export async function getUserReferralReview(env, referredUserId) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT * FROM referral_reviews WHERE referred_user_id = ?')
+    .bind(String(referredUserId))
+    .first();
+  return mapReferralReviewRow(row);
+}
+
+export async function getReferralReviewById(env, reviewId) {
+  const db = assertDB(env);
+  const row = await db
+    .prepare('SELECT * FROM referral_reviews WHERE id = ?')
+    .bind(String(reviewId))
+    .first();
+  return mapReferralReviewRow(row);
+}
+
+/**
+ * Atomically persist a device verification attempt, update fingerprint cluster mappings,
+ * update the user's verification status, enqueue a suspicious referral review if applicable,
+ * and append an immutable verification audit log entry.
+ */
+export async function recordDeviceVerificationAtomic(
+  env,
+  {
+    verificationId,
+    userId,
+    telegramAuthDate,
+    initDataHash,
+    strictFpHash,
+    fuzzyFpHash,
+    signalHashes = {},
+    ipHash = '',
+    ipSubnetHash = '',
+    countryCode = '',
+    asn = '',
+    asnOrg = '',
+    proxyVpnFlag = false,
+    datacenterFlag = false,
+    riskScore = 0,
+    riskReasons = [],
+    verdict,
+    verifiedTokenJti = null,
+    pendingReferrerId = null,
+    matchedUserIds = [],
+    now = Date.now(),
+  }
+) {
+  const db = assertDB(env);
+  const uid = String(userId);
+  const safeScore = Math.max(0, Math.min(100, toInt(riskScore, 0)));
+  const verifiedAt = verdict === 'verified' ? now : null;
+  const auditId = generateId('VAUD');
+  const reviewId =
+    pendingReferrerId && (verdict === 'pending_review' || verdict === 'rejected')
+      ? generateId('RREV')
+      : null;
+
+  const statements = [
+    db
+      .prepare(
+        `INSERT INTO device_verifications (
+          id, user_id, telegram_auth_date, init_data_hash, strict_fp_hash, fuzzy_fp_hash,
+          signal_hashes_json, ip_hash, ip_subnet_hash, country_code, asn, asn_org,
+          proxy_vpn_flag, datacenter_flag, risk_score, risk_reasons_json,
+          verdict, verified_token_jti, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        String(verificationId),
+        uid,
+        toInt(telegramAuthDate),
+        String(initDataHash),
+        String(strictFpHash),
+        String(fuzzyFpHash),
+        JSON.stringify(signalHashes || {}),
+        String(ipHash),
+        String(ipSubnetHash),
+        String(countryCode).slice(0, 16),
+        String(asn).slice(0, 32),
+        String(asnOrg).slice(0, 120),
+        proxyVpnFlag ? 1 : 0,
+        datacenterFlag ? 1 : 0,
+        safeScore,
+        JSON.stringify(riskReasons || []),
+        String(verdict),
+        verifiedTokenJti ? String(verifiedTokenJti) : null,
+        now,
+        now
+      ),
+
+    db
+      .prepare(
+        `INSERT INTO device_fingerprint_accounts (
+          fingerprint_type, fingerprint_hash, user_id, first_seen_at, last_seen_at, seen_count
+        ) VALUES ('strict', ?, ?, ?, ?, 1)
+        ON CONFLICT(fingerprint_type, fingerprint_hash, user_id) DO UPDATE SET
+          last_seen_at = excluded.last_seen_at,
+          seen_count = device_fingerprint_accounts.seen_count + 1`
+      )
+      .bind(String(strictFpHash), uid, now, now),
+
+    db
+      .prepare(
+        `INSERT INTO device_fingerprint_accounts (
+          fingerprint_type, fingerprint_hash, user_id, first_seen_at, last_seen_at, seen_count
+        ) VALUES ('fuzzy', ?, ?, ?, ?, 1)
+        ON CONFLICT(fingerprint_type, fingerprint_hash, user_id) DO UPDATE SET
+          last_seen_at = excluded.last_seen_at,
+          seen_count = device_fingerprint_accounts.seen_count + 1`
+      )
+      .bind(String(fuzzyFpHash), uid, now, now),
+
+    db
+      .prepare(
+        `UPDATE users
+         SET device_verification_status = ?,
+             device_verified_at = CASE WHEN ? IS NOT NULL THEN ? ELSE device_verified_at END,
+             device_risk_score = ?,
+             device_fingerprint_hash = ?
+         WHERE telegram_id = ?
+           AND device_verification_status NOT IN ('verified', 'grandfathered')`
+      )
+      .bind(String(verdict), verifiedAt, verifiedAt, safeScore, String(strictFpHash), uid),
+  ];
+
+  if (verdict === 'verified') {
+    statements.push(
+      db
+        .prepare(
+          `UPDATE referral_reviews
+           SET status = 'approved',
+               reviewed_by = 'system_retry',
+               reviewed_at = ?,
+               review_note = 'Auto-cleared after clean retry verification',
+               updated_at = ?
+           WHERE referred_user_id = ? AND status = 'pending'`
+        )
+        .bind(now, now, uid)
+    );
+  }
+
+  if (reviewId && pendingReferrerId) {
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO referral_reviews (
+            id, referred_user_id, referrer_id, verification_id, cluster_fp_hash,
+            matched_user_ids_json, risk_score, risk_reasons_json, status,
+            created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+          ON CONFLICT(referred_user_id) DO UPDATE SET
+            verification_id = excluded.verification_id,
+            cluster_fp_hash = excluded.cluster_fp_hash,
+            matched_user_ids_json = excluded.matched_user_ids_json,
+            risk_score = excluded.risk_score,
+            risk_reasons_json = excluded.risk_reasons_json,
+            updated_at = excluded.updated_at
+          WHERE referral_reviews.status = 'pending'`
+        )
+        .bind(
+          reviewId,
+          uid,
+          String(pendingReferrerId),
+          String(verificationId),
+          String(strictFpHash),
+          JSON.stringify(matchedUserIds || []),
+          safeScore,
+          JSON.stringify(riskReasons || []),
+          now,
+          now
+        )
+    );
+  }
+
+  statements.push(
+    db
+      .prepare(
+        `INSERT INTO verification_audit_logs (
+          id, event_type, user_id, actor_id, verification_id, review_id,
+          verdict, risk_score, details_json, created_at
+        ) VALUES (?, ?, ?, 'system', ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        auditId,
+        `DEVICE_VERIFY_${String(verdict).toUpperCase()}`,
+        uid,
+        String(verificationId),
+        reviewId,
+        String(verdict),
+        safeScore,
+        JSON.stringify({
+          reasons: riskReasons || [],
+          matchedUserCount: Array.isArray(matchedUserIds) ? matchedUserIds.length : 0,
+          countryCode: String(countryCode || ''),
+          proxyVpnFlag: Boolean(proxyVpnFlag),
+          datacenterFlag: Boolean(datacenterFlag),
+        }),
+        now
+      )
+  );
+
+  try {
+    await db.batch(statements);
+    return { ok: true, verificationId, reviewId, auditId };
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('UNIQUE') && msg.includes('init_data_hash')) {
+      return { ok: false, replay: true, error: 'Duplicate or replayed Telegram verification payload.' };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Atomically resolve a pending referral review (`approved` or `rejected`) inside ONE single
+ * Cloudflare D1 transaction batch (`db.batch()`):
+ *   - On `approved`: updates `referral_reviews`, verifies user, and (if eligible) atomically
+ *     inserts `referral_claims`, `referrals`, credits referrer balance & referral totals,
+ *     appends immutable `ledger` entry, and appends immutable `verification_audit_logs`.
+ *   - On `rejected`: updates `referral_reviews`, marks user `'rejected'`, clears
+ *     `pending_referrer_id`, and appends immutable `verification_audit_logs`.
+ */
+export async function resolveReferralReviewAtomic(
+  env,
+  { reviewId, decision, adminId, note = '', rewardPaise = null, now = Date.now() }
+) {
+  const db = assertDB(env);
+  const review = await getReferralReviewById(env, reviewId);
+  if (!review) {
+    return { ok: false, error: 'Referral review record not found.' };
+  }
+  if (review.status !== 'pending') {
+    return { ok: false, alreadyProcessed: true, review, error: `Review is already ${review.status}.` };
+  }
+
+  const normalizedDecision = decision === 'approved' ? 'approved' : 'rejected';
+  const nextUserStatus = normalizedDecision === 'approved' ? 'verified' : 'rejected';
+  const verifiedAt = normalizedDecision === 'approved' ? now : null;
+  const auditId = generateId('VAUD');
+
+  const [referredUser, referrerUser, existingClaim, settings] = await Promise.all([
+    getUser(env, review.referredUserId),
+    getUser(env, review.referrerId),
+    getReferralClaim(env, review.referredUserId),
+    rewardPaise === null ? getSettings(env) : Promise.resolve(null),
+  ]);
+
+  const safeRewardPaise =
+    rewardPaise !== null
+      ? toNonNegInt(rewardPaise)
+      : toNonNegInt(settings?.referralRewardPaise ?? 300);
+
+  const shouldCreditReferral =
+    normalizedDecision === 'approved' &&
+    Boolean(referredUser) &&
+    Boolean(referrerUser) &&
+    referrerUser.status !== 'banned' &&
+    review.referrerId !== review.referredUserId &&
+    !referredUser.referralCredited &&
+    !referredUser.referredBy &&
+    !existingClaim;
+
+  const statements = [
+    db
+      .prepare(
+        `UPDATE referral_reviews
+         SET status = ?,
+             reviewed_by = ?,
+             reviewed_at = ?,
+             review_note = ?,
+             updated_at = ?
+         WHERE id = ? AND status = 'pending'`
+      )
+      .bind(
+        normalizedDecision,
+        String(adminId),
+        now,
+        String(note || '').slice(0, 300),
+        now,
+        String(reviewId)
+      ),
+  ];
+
+  if (shouldCreditReferral) {
+    const referralRowId = generateId('REF');
+    const ledgerId = generateId('LDG');
+    const referredName =
+      [referredUser.firstName || '', referredUser.lastName || ''].join(' ').trim() ||
+      'Telegram User';
+    const referredUsername = referredUser.username || '';
+
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO referral_claims (referred_user_id, referrer_id, amount_paise, credited_at)
+           VALUES (?, ?, ?, ?)`
+        )
+        .bind(review.referredUserId, review.referrerId, safeRewardPaise, now),
+
+      db
+        .prepare(
+          `INSERT INTO referrals (id, referrer_id, referred_user_id, referred_name, referred_username, amount_paise, credited_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        )
+        .bind(
+          referralRowId,
+          review.referrerId,
+          review.referredUserId,
+          referredName,
+          referredUsername,
+          safeRewardPaise,
+          now
+        ),
+
+      db
+        .prepare(
+          `UPDATE users
+           SET device_verification_status = 'verified',
+               device_verified_at = ?,
+               referred_by = ?,
+               pending_referrer_id = NULL,
+               referral_credited = 1
+           WHERE telegram_id = ?`
+        )
+        .bind(now, review.referrerId, review.referredUserId),
+
+      db
+        .prepare(
+          `UPDATE users
+           SET balance_paise = balance_paise + ?,
+               total_earned_paise = total_earned_paise + ?,
+               referral_earnings_paise = referral_earnings_paise + ?,
+               total_referrals = total_referrals + 1
+           WHERE telegram_id = ?`
+        )
+        .bind(safeRewardPaise, safeRewardPaise, safeRewardPaise, review.referrerId)
+    );
+
+    if (safeRewardPaise > 0) {
+      statements.push(
+        db
+          .prepare(
+            `INSERT INTO ledger (
+              id, user_id, entry_type, direction, amount_paise,
+              balance_before_paise, balance_after_paise,
+              reference_type, reference_id, description, created_at
+            )
+            SELECT ?, telegram_id, 'referral_credit', 'credit', ?,
+                   balance_paise - ?, balance_paise,
+                   'referral', ?, ?, ?
+            FROM users
+            WHERE telegram_id = ?`
+          )
+          .bind(
+            ledgerId,
+            safeRewardPaise,
+            safeRewardPaise,
+            review.referredUserId,
+            `Referral reward (admin approved review ${review.id}) for user ${review.referredUserId}`,
+            now,
+            review.referrerId
+          )
+      );
+    }
+  } else {
+    statements.push(
+      db
+        .prepare(
+          `UPDATE users
+           SET device_verification_status = ?,
+               device_verified_at = CASE WHEN ? IS NOT NULL THEN ? ELSE device_verified_at END,
+               pending_referrer_id = CASE WHEN ? = 'rejected' THEN NULL ELSE pending_referrer_id END
+           WHERE telegram_id = ?`
+        )
+        .bind(nextUserStatus, verifiedAt, verifiedAt, normalizedDecision, review.referredUserId)
+    );
+  }
+
+  statements.push(
+    db
+      .prepare(
+        `INSERT INTO verification_audit_logs (
+          id, event_type, user_id, actor_id, verification_id, review_id,
+          verdict, risk_score, details_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .bind(
+        auditId,
+        normalizedDecision === 'approved' ? 'REFERRAL_REVIEW_APPROVED' : 'REFERRAL_REVIEW_REJECTED',
+        review.referredUserId,
+        String(adminId),
+        review.verificationId,
+        review.id,
+        nextUserStatus,
+        review.riskScore,
+        JSON.stringify({
+          referrerId: review.referrerId,
+          referralCredited: shouldCreditReferral,
+          amountPaise: shouldCreditReferral ? safeRewardPaise : 0,
+          note: String(note || '').slice(0, 300),
+          matchedUserIds: review.matchedUserIds,
+        }),
+        now
+      )
+  );
+
+  let batchRes;
+  try {
+    batchRes = await db.batch(statements);
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (msg.includes('UNIQUE') || msg.includes('PRIMARY KEY') || msg.includes('CONSTRAINT')) {
+      return { ok: false, alreadyProcessed: true, error: 'Referral was already claimed or processed concurrently.' };
+    }
+    throw err;
+  }
+
+  const reviewUpdated = Number(batchRes?.[0]?.meta?.changes ?? 0) > 0;
+  if (!reviewUpdated) {
+    return { ok: false, alreadyProcessed: true, error: 'Review was already resolved concurrently.' };
+  }
+
+  const [updatedReview, updatedUser, updatedReferrer] = await Promise.all([
+    getReferralReviewById(env, reviewId),
+    getUser(env, review.referredUserId),
+    getUser(env, review.referrerId),
+  ]);
+
+  return {
+    ok: true,
+    review: updatedReview,
+    user: updatedUser,
+    referrer: updatedReferrer,
+    referralCredited: shouldCreditReferral,
+    amountPaise: shouldCreditReferral ? safeRewardPaise : 0,
+    auditId,
+  };
+}
+
+export async function getDeviceVerificationStats(env) {
+  const db = assertDB(env);
+  const [userCounts, reviewCounts, clusterRow, attemptsRow] = await Promise.all([
+    db
+      .prepare(
+        `SELECT
+          SUM(CASE WHEN device_verification_status = 'verified' THEN 1 ELSE 0 END) AS verified_cnt,
+          SUM(CASE WHEN device_verification_status = 'grandfathered' THEN 1 ELSE 0 END) AS grandfathered_cnt,
+          SUM(CASE WHEN device_verification_status = 'unverified' THEN 1 ELSE 0 END) AS unverified_cnt,
+          SUM(CASE WHEN device_verification_status = 'pending_review' THEN 1 ELSE 0 END) AS pending_review_cnt,
+          SUM(CASE WHEN device_verification_status = 'rejected' THEN 1 ELSE 0 END) AS rejected_cnt
+         FROM users`
+      )
+      .first(),
+    db
+      .prepare(
+        `SELECT
+          SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_cnt,
+          SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved_cnt,
+          SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected_cnt
+         FROM referral_reviews`
+      )
+      .first(),
+    db
+      .prepare(
+        `SELECT COUNT(*) AS cluster_cnt FROM (
+          SELECT fingerprint_hash
+          FROM device_fingerprint_accounts
+          WHERE fingerprint_type = 'strict'
+          GROUP BY fingerprint_hash
+          HAVING COUNT(DISTINCT user_id) > 1
+        )`
+      )
+      .first(),
+    db.prepare('SELECT COUNT(*) AS attempts_cnt FROM device_verifications').first(),
+  ]);
+
+  return {
+    verifiedUsers: toNonNegInt(userCounts?.verified_cnt),
+    grandfatheredUsers: toNonNegInt(userCounts?.grandfathered_cnt),
+    unverifiedUsers: toNonNegInt(userCounts?.unverified_cnt),
+    pendingReviewUsers: toNonNegInt(userCounts?.pending_review_cnt),
+    rejectedUsers: toNonNegInt(userCounts?.rejected_cnt),
+    pendingReferralReviews: toNonNegInt(reviewCounts?.pending_cnt),
+    approvedReferralReviews: toNonNegInt(reviewCounts?.approved_cnt),
+    rejectedReferralReviews: toNonNegInt(reviewCounts?.rejected_cnt),
+    duplicateDeviceClusters: toNonNegInt(clusterRow?.cluster_cnt),
+    totalAttempts: toNonNegInt(attemptsRow?.attempts_cnt),
+  };
+}
+
+export async function getPendingReferralReviewsPage(env, page = 1, pageSize = 5) {
+  const db = assertDB(env);
+  const countRow = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM referral_reviews WHERE status = 'pending'")
+    .first();
+  const total = toNonNegInt(countRow?.cnt);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.max(1, Math.min(toInt(page, 1), totalPages));
+  const offset = (safePage - 1) * pageSize;
+
+  const res = await db
+    .prepare(
+      `SELECT * FROM referral_reviews
+       WHERE status = 'pending'
+       ORDER BY created_at DESC
+       LIMIT ? OFFSET ?`
+    )
+    .bind(pageSize, offset)
+    .all();
+
+  return {
+    total,
+    totalPages,
+    page: safePage,
+    items: (res.results || []).map(mapReferralReviewRow),
+  };
+}
+
+export async function getSuspiciousDeviceClustersPage(env, page = 1, pageSize = 5) {
+  const db = assertDB(env);
+  const countRow = await db
+    .prepare(
+      `SELECT COUNT(*) AS cnt FROM (
+        SELECT fingerprint_hash
+        FROM device_fingerprint_accounts
+        WHERE fingerprint_type = 'strict'
+        GROUP BY fingerprint_hash
+        HAVING COUNT(DISTINCT user_id) > 1
+      )`
+    )
+    .first();
+  const total = toNonNegInt(countRow?.cnt);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.max(1, Math.min(toInt(page, 1), totalPages));
+  const offset = (safePage - 1) * pageSize;
+
+  const res = await db
+    .prepare(
+      `SELECT
+        dfa.fingerprint_hash,
+        COUNT(DISTINCT dfa.user_id) AS account_count,
+        GROUP_CONCAT(dfa.user_id, ',') AS user_ids,
+        MAX(dfa.last_seen_at) AS last_seen_at,
+        MAX(COALESCE(u.device_risk_score, 0)) AS max_risk_score
+       FROM device_fingerprint_accounts dfa
+       LEFT JOIN users u ON u.telegram_id = dfa.user_id
+       WHERE dfa.fingerprint_type = 'strict'
+       GROUP BY dfa.fingerprint_hash
+       HAVING COUNT(DISTINCT dfa.user_id) > 1
+       ORDER BY account_count DESC, last_seen_at DESC
+       LIMIT ? OFFSET ?`
+    )
+    .bind(pageSize, offset)
+    .all();
+
+  return {
+    total,
+    totalPages,
+    page: safePage,
+    items: (res.results || []).map((row) => ({
+      fingerprintHash: String(row.fingerprint_hash),
+      accountCount: toNonNegInt(row.account_count),
+      userIds: String(row.user_ids || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+      lastSeenAt: toInt(row.last_seen_at),
+      maxRiskScore: toNonNegInt(row.max_risk_score),
+    })),
+  };
+}
+
 

@@ -8,6 +8,7 @@ import {
   countActiveUsers,
   countPendingWithdrawals,
   getAllCategoryStockSummary,
+  getDeviceVerificationStats,
   getGlobalStats,
   getSettings,
   hasAdminPermission,
@@ -24,12 +25,13 @@ export async function handleAdminStatistics(env, adminId, chatId, messageId = nu
     return;
   }
 
-  const [userCounts, stats, stock, pendingCount, settings] = await Promise.all([
+  const [userCounts, stats, stock, pendingCount, settings, dvStats] = await Promise.all([
     countActiveUsers(env),
     getGlobalStats(env),
     getAllCategoryStockSummary(env),
     countPendingWithdrawals(env),
     getSettings(env),
+    getDeviceVerificationStats(env),
   ]);
 
   const amazonStock = stock.categories.amazon.availableCount;
@@ -41,6 +43,11 @@ export async function handleAdminStatistics(env, adminId, chatId, messageId = nu
     `👥 <b>Users Overview</b>\n` +
     `• Total Registered Users: <b>${userCounts.totalUsers}</b>\n` +
     `• Active Users (7d): <b>${userCounts.activeUsers}</b>\n` +
+    `${DIVIDER}\n` +
+    `🛡️ <b>Device Verification</b>\n` +
+    `• Verified: <b>${dvStats.verifiedUsers}</b> | Grandfathered: <b>${dvStats.grandfatheredUsers}</b>\n` +
+    `• Pending Review: <b>${dvStats.pendingReviewUsers}</b> | Rejected: <b>${dvStats.rejectedUsers}</b>\n` +
+    `• Duplicate Device Clusters: <b>${dvStats.duplicateDeviceClusters}</b> | Pending Ref Reviews: <b>${dvStats.pendingReferralReviews}</b>\n` +
     `${DIVIDER}\n` +
     `🤝 <b>Referrals & Daily Bonuses</b>\n` +
     `• Total Referrals: <b>${stats.totalReferrals}</b>\n` +

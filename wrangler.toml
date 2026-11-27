@@ -1,12 +1,15 @@
 # ============================================================================
 # 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Cloudflare Workers + D1 Configuration
 # ============================================================================
-# 1. Apply D1 SQL migrations BEFORE deploying:
-#      npx wrangler d1 migrations apply pna-rewards-db --remote
+# 1. Inspect remote D1 & safely apply ONLY pending migration 0002 (do NOT rerun 0001):
+#      npm run db:integrity:remote
+#      npm run db:apply:0002:remote   # only if device_verification_status is absent
 #
 # 2. Set Worker secrets (NEVER put secrets in this file):
 #      npx wrangler secret put BOT_TOKEN
 #      npx wrangler secret put WEBHOOK_SECRET
+#      npx wrangler secret put MINIAPP_BRIDGE_SECRET
+#      npx wrangler secret put VERIFICATION_SIGNING_SECRET   # optional (falls back to HKDF of bridge secret)
 #
 # 3. Deploy:
 #      npx wrangler deploy
@@ -30,11 +33,15 @@ migrations_dir = "migrations"
 OWNER_ID = "8838351233"
 SUPPORT_USERNAME = "@Pritam_power"
 UPDATE_CHANNEL_URL = "https://t.me/pnarewards"
-# Secretary Mode (PnA X Logs) target channel:
-# Public channel https://t.me/pnarewards uses "@pnarewards" (auto-resolves numeric ID when bot is admin).
-# If switching to a private channel, set its numeric ID (e.g. "-1001234567890") after making the bot admin.
-PNA_LOG_CHANNEL_ID = "@pnarewards"
+# Secretary Mode (PnA X Logs) is intentionally INACTIVE by default.
+# NEVER set this to the public @pnarewards update channel.
+# Only configure a dedicated private admin channel numeric ID (e.g. "-1001234567890") if explicitly enabling Secretary Mode.
+PNA_LOG_CHANNEL_ID = ""
 TIMEZONE = "Asia/Kolkata"
 WEBHOOK_PATH = "/webhook"
 # Optional: set BOT_USERNAME (without @) to avoid an extra getMe lookup on cold start
 BOT_USERNAME = ""
+# Telegram Mini App (Google Cloud Run) Device Verification settings
+DEVICE_VERIFICATION_ENABLED = "true"
+MINIAPP_URL = "https://ais-pre-5anw25hqtptdicmzho3ex7-704214232389.asia-east1.run.app"
+MINIAPP_ALLOWED_ORIGINS = "https://ais-pre-5anw25hqtptdicmzho3ex7-704214232389.asia-east1.run.app,https://ais-dev-5anw25hqtptdicmzho3ex7-704214232389.asia-east1.run.app"

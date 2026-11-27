@@ -8,16 +8,27 @@ import {
   playVerificationAnimation,
   playWelcomeAnimation,
 } from '../animations.js';
-import { BOT_BRAND, escapeHtml } from '../config.js';
+import {
+  BOT_BRAND,
+  DEVICE_VERIFICATION_STATUS,
+  escapeHtml,
+  getMiniAppUrl,
+  isDeviceVerificationEnabled,
+} from '../config.js';
 import {
   clearUserState,
   createOrUpdateUserFromTelegram,
   getSettings,
   getUser,
+  getUserReferralReview,
   isAdmin,
   updateUserForceJoinVerified,
 } from '../database.js';
-import { forceJoinKeyboard, mainMenuKeyboard } from '../keyboards.js';
+import {
+  deviceVerificationKeyboard,
+  forceJoinKeyboard,
+  mainMenuKeyboard,
+} from '../keyboards.js';
 import { verifyUserForceJoin } from '../services/membership.js';
 import {
   processPendingReferral,
@@ -25,6 +36,64 @@ import {
 } from '../services/referral-service.js';
 import { logNewUserEvent } from '../services/secretary.js';
 import { answerCallbackQuery, editMessageText, sendMessage } from '../telegram.js';
+
+/**
+ * Check whether a user satisfies the server-side device verification requirement.
+ * Admins and pre-existing grandfathered users pass seamlessly.
+ */
+export function isUserDeviceVerified(user, env, isAdminUser = false) {
+  if (isAdminUser) return true;
+  if (!isDeviceVerificationEnabled(env)) return true;
+  if (!user) return false;
+  const status = user.deviceVerificationStatus || DEVICE_VERIFICATION_STATUS.UNVERIFIED;
+  return (
+    status === DEVICE_VERIFICATION_STATUS.VERIFIED ||
+    status === DEVICE_VERIFICATION_STATUS.GRANDFATHERED
+  );
+}
+
+/**
+ * Build the Device Verification Mini App gate message shown after channel force-join.
+ */
+export async function sendDeviceVerificationPrompt(env, chatId, user, messageId = null) {
+  const miniAppUrl = getMiniAppUrl(env);
+  const status = user?.deviceVerificationStatus || DEVICE_VERIFICATION_STATUS.UNVERIFIED;
+  const review = user?.id ? await getUserReferralReview(env, user.id) : null;
+
+  let text = '';
+  if (status === DEVICE_VERIFICATION_STATUS.PENDING_REVIEW) {
+    text =
+      `${buildHeader('⏳', 'DEVICE VERIFICATION UNDER REVIEW')}\n` +
+      `✅ Channel membership is verified!\n\n` +
+      `Your device verification is currently <b>under security review</b> by our admin team to keep referrals fair for everyone.\n` +
+      `${review?.id ? `🆔 <b>Review ID:</b> <code>${escapeHtml(review.id)}</code>\n` : ''}\n` +
+      `• If you used a VPN or temporary browser, disable it and retry below.\n` +
+      `• Otherwise, once an admin approves your review, tap <b>✅ Check Verification Status</b>.`;
+  } else if (status === DEVICE_VERIFICATION_STATUS.REJECTED) {
+    text =
+      `${buildHeader('🛡️', 'DEVICE VERIFICATION REQUIRED')}\n` +
+      `Automatic device verification could not be completed for this account.\n` +
+      `${review?.id ? `🆔 <b>Review ID:</b> <code>${escapeHtml(review.id)}</code>\n` : ''}\n` +
+      `Please contact Support with your Telegram ID (<code>${escapeHtml(user?.id || '')}</code>) if you believe this is a mistake.`;
+  } else {
+    text =
+      `${buildHeader('🛡️', 'ONE LAST STEP — VERIFY DEVICE')}\n` +
+      `✅ <b>Channel membership verified!</b>\n\n` +
+      `To unlock <b>${BOT_BRAND}</b> and protect genuine rewards against multi-account abuse, please complete a quick one-time device check in our secure Telegram Mini App.\n\n` +
+      `🔒 <i>Privacy note: We check standard browser/device signals (not hardware IMEI or private files) to verify your session.</i>\n\n` +
+      `👇 Tap <b>🛡️ Open Mini App & Verify Device</b> below:`;
+  }
+
+  if (!miniAppUrl) {
+    text += `\n\n⚠️ <i>Mini App URL is not configured yet. Please contact the bot administrator.</i>`;
+  }
+
+  const extra = { reply_markup: deviceVerificationKeyboard(miniAppUrl, status) };
+  if (messageId) {
+    return editMessageText(env, chatId, messageId, text, extra);
+  }
+  return sendMessage(env, chatId, text, extra);
+}
 
 /**
  * Build detailed per-channel force-join message so users know exactly
@@ -106,6 +175,7 @@ export async function sendForceJoinPrompt(env, chatId, fjResult, messageId = nul
  *  1. Account exists & not banned
  *  2. Maintenance Mode (admins bypass)
  *  3. Force-Join channel membership (never bypassed for normal users)
+ *  4. Server-side Telegram Mini App Device Verification (grandfathered & admins pass)
  */
 export async function ensureUserAccess(env, tgUser, chatId) {
   const { user } = await createOrUpdateUserFromTelegram(env, tgUser);
@@ -142,6 +212,12 @@ export async function ensureUserAccess(env, tgUser, chatId) {
     await updateUserForceJoinVerified(env, user.id, true);
   }
 
+  // Enforce server-side device verification gate before unlocking bot menu or rewards
+  if (!isUserDeviceVerified(user, env, adminUser)) {
+    await sendDeviceVerificationPrompt(env, chatId, user, null);
+    return { allowed: false, user, isAdminUser: adminUser };
+  }
+
   return { allowed: true, user, isAdminUser: adminUser };
 }
 
@@ -170,7 +246,7 @@ export async function handleStartCommand(env, message, startPayload = '') {
   const { user, isNew } = await createOrUpdateUserFromTelegram(env, tgUser);
   const adminUser = await isAdmin(user.id, env);
 
-  // Record referral intent ONLY if genuinely new Telegram user
+  // Record referral intent ONLY if genuinely new Telegram user (NOT credited yet)
   let attributedReferrerId = '';
   if (isNew && startPayload) {
     const registered = await registerPendingReferralIfEligible(env, user, startPayload);
@@ -204,20 +280,25 @@ export async function handleStartCommand(env, message, startPayload = '') {
   // Play attractive multi-step welcome animation
   await playWelcomeAnimation(env, chatId, user.firstName);
 
-  // Check force-join channels
+  // Step 1: Check force-join channels (unlock NOTHING until verified)
   const fj = await verifyUserForceJoin(env, user.id, { bypassForAdmin: true });
   if (!fj.joinedAll) {
     await sendForceJoinPrompt(env, chatId, fj, null, false);
     return;
   }
 
-  // User passed force join (or no force-join channels configured)
   if (!user.forceJoinVerified) {
     user.forceJoinVerified = true;
     await updateUserForceJoinVerified(env, user.id, true);
   }
 
-  // Credit pending referral if eligible
+  // Step 2: Check server-side Mini App Device Verification before unlocking menu or referrals
+  if (!isUserDeviceVerified(user, env, adminUser)) {
+    await sendDeviceVerificationPrompt(env, chatId, user, null);
+    return;
+  }
+
+  // Only verified/grandfathered users can finalize pending referrals
   await processPendingReferral(env, user.id);
 
   const confirmText =
@@ -256,11 +337,17 @@ export async function handleVerifyForceJoinCallback(env, callbackQuery) {
     return;
   }
 
-  // Mark verified without overwriting concurrent fields
+  // Mark force-join verified without overwriting concurrent fields
   await updateUserForceJoinVerified(env, user.id, true);
   const freshUser = (await getUser(env, user.id)) || { ...user, forceJoinVerified: true };
 
-  // Credit pending referral immediately upon confirmed membership
+  // Step 2 Gate: Do NOT unlock main menu or credit referral until device verification passes
+  if (!isUserDeviceVerified(freshUser, env, adminUser)) {
+    await sendDeviceVerificationPrompt(env, chatId, freshUser, msgId);
+    return;
+  }
+
+  // Already verified/grandfathered user -> finalize pending referral and unlock menu
   await processPendingReferral(env, freshUser.id);
 
   await editMessageText(
@@ -277,4 +364,45 @@ export async function handleVerifyForceJoinCallback(env, callbackQuery) {
     adminUser,
     `🏠 <b>Main Menu — ${BOT_BRAND}</b>\n${DIVIDER}\n👇 Tap any button below to start earning rewards!`
   );
+}
+
+/**
+ * Handle "✅ Check Verification Status" callback (`dv:status`).
+ */
+export async function handleDeviceVerifyStatusCallback(env, callbackQuery) {
+  const tgUser = callbackQuery.from;
+  const chatId = callbackQuery.message?.chat?.id || tgUser.id;
+  const msgId = callbackQuery.message?.message_id;
+
+  const { user } = await createOrUpdateUserFromTelegram(env, tgUser);
+  const adminUser = await isAdmin(user.id, env);
+
+  const fj = await verifyUserForceJoin(env, user.id, { bypassForAdmin: true });
+  if (!fj.joinedAll) {
+    await answerCallbackQuery(env, callbackQuery.id, '⚠️ Please join all required channels first.', true);
+    await sendForceJoinPrompt(env, chatId, fj, msgId, true);
+    return;
+  }
+
+  if (!isUserDeviceVerified(user, env, adminUser)) {
+    const statusLabel =
+      user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.PENDING_REVIEW
+        ? '⏳ Still under admin security review.'
+        : '🛡️ Please open the Mini App button to verify your device.';
+    await answerCallbackQuery(env, callbackQuery.id, statusLabel, true);
+    await sendDeviceVerificationPrompt(env, chatId, user, msgId);
+    return;
+  }
+
+  await answerCallbackQuery(env, callbackQuery.id, '✅ Device verified! Unlocking dashboard...');
+  await processPendingReferral(env, user.id);
+
+  await editMessageText(
+    env,
+    chatId,
+    msgId,
+    `✅ <b>Device Verified Successfully!</b>\n${DIVIDER}\n🎉 Welcome to <b>${BOT_BRAND}</b>!\nYour rewards dashboard is now unlocked.`
+  );
+
+  await sendMainMenu(env, chatId, user, adminUser);
 }

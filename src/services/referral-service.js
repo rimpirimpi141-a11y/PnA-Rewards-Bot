@@ -2,7 +2,11 @@
 // 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Referral Tracking & Anti-Duplicate Protection Service (D1)
 // ============================================================================
 
-import { formatUserName } from '../config.js';
+import {
+  DEVICE_VERIFICATION_STATUS,
+  formatUserName,
+  isDeviceVerificationEnabled,
+} from '../config.js';
 import {
   clearUserPendingReferrer,
   executeReferralCreditTransaction,
@@ -74,11 +78,14 @@ export async function registerPendingReferralIfEligible(env, newUser, rawStartPa
 }
 
 /**
- * Finalize and credit a pending referral once the new user passes onboarding / force-join.
+ * Finalize and credit a pending referral ONLY after the referred user passes BOTH:
+ *   1. Force-join channel membership verification
+ *   2. Server-side Telegram Mini App device verification (or grandfathered/admin-approved)
+ *
  * Protected atomically by D1 transaction batch + PRIMARY KEY on referral_claims(referred_user_id)
  * + UNIQUE ledger idempotency so a Telegram user can NEVER trigger duplicate referral rewards.
  */
-export async function processPendingReferral(env, userId) {
+export async function processPendingReferral(env, userId, { allowAdminOverride = false } = {}) {
   const referredId = String(userId);
   const user = await getUser(env, referredId);
   if (!user || !user.pendingReferrerId) {
@@ -88,6 +95,22 @@ export async function processPendingReferral(env, userId) {
   if (user.referralCredited || user.referredBy) {
     await clearUserPendingReferrer(env, referredId);
     return { credited: false, reason: 'already_credited' };
+  }
+
+  // CRITICAL: Never credit an unverified, pending_review, or rejected account
+  if (!allowAdminOverride) {
+    if (!user.forceJoinVerified) {
+      return { credited: false, reason: 'force_join_not_verified' };
+    }
+    if (isDeviceVerificationEnabled(env)) {
+      const status = user.deviceVerificationStatus || DEVICE_VERIFICATION_STATUS.UNVERIFIED;
+      const isVerified =
+        status === DEVICE_VERIFICATION_STATUS.VERIFIED ||
+        status === DEVICE_VERIFICATION_STATUS.GRANDFATHERED;
+      if (!isVerified) {
+        return { credited: false, reason: `device_${status}` };
+      }
+    }
   }
 
   const referrerId = String(user.pendingReferrerId);

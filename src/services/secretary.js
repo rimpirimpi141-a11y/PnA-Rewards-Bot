@@ -47,31 +47,50 @@ const AUTO_VERIFY_THROTTLE_MS = 60 * 1000;
  */
 export function redactSecrets(rawText, env) {
   let out = String(rawText ?? '');
-  const botToken = env?.BOT_TOKEN ? String(env.BOT_TOKEN).trim() : '';
-  const webhookSecret = env?.WEBHOOK_SECRET ? String(env.WEBHOOK_SECRET).trim() : '';
+  const secrets = [
+    [env?.BOT_TOKEN, '[REDACTED_BOT_TOKEN]', 8],
+    [env?.WEBHOOK_SECRET, '[REDACTED_WEBHOOK_SECRET]', 6],
+    [env?.MINIAPP_BRIDGE_SECRET, '[REDACTED_BRIDGE_SECRET]', 8],
+    [env?.VERIFICATION_SIGNING_SECRET, '[REDACTED_SIGNING_SECRET]', 8],
+  ];
 
-  if (botToken && botToken.length >= 8) {
-    out = out.split(botToken).join('[REDACTED_BOT_TOKEN]');
-  }
-  if (webhookSecret && webhookSecret.length >= 6) {
-    out = out.split(webhookSecret).join('[REDACTED_WEBHOOK_SECRET]');
+  for (const [val, mask, minLen] of secrets) {
+    const clean = val ? String(val).trim() : '';
+    if (clean && clean.length >= minLen) {
+      out = out.split(clean).join(mask);
+    }
   }
   // Also redact generic Telegram bot token patterns
   out = out.replace(/\b\d{6,12}:[A-Za-z0-9_-]{25,}\b/g, '[REDACTED_TOKEN]');
   return out;
 }
 
+function isBlockedPublicUpdateChannel(target, env = null) {
+  const norm = String(target || '').trim().toLowerCase();
+  if (!norm) return false;
+  if (norm === '@pnarewards' || norm === 'pnarewards') return true;
+  const updateUrl = String(env?.UPDATE_CHANNEL_URL || 'https://t.me/pnarewards').trim();
+  try {
+    const seg = new URL(updateUrl).pathname.replace(/^\/+/, '').split('/')[0]?.toLowerCase() || '';
+    if (seg && (norm === `@${seg}` || norm === seg)) return true;
+  } catch {
+    // ignore malformed URL
+  }
+  return false;
+}
+
 /**
  * Normalize a channel identifier for Telegram Bot API (`@username` or `-100...`).
- * Explicitly rejects private invite links (`t.me/+...`, `joinchat/...`) because
- * invite links are NOT chat IDs.
+ * Explicitly rejects private invite links (`t.me/+...`, `joinchat/...`) and
+ * hard-blocks the public update channel (`@pnarewards`) so private audit logs
+ * can never leak publicly.
  */
-export function parseSecretaryChannelInput(rawInput) {
+export function parseSecretaryChannelInput(rawInput, env = null) {
   const input = String(rawInput || '').trim();
   if (!input) {
     return {
       ok: false,
-      error: 'No log channel is configured. Set PNA_LOG_CHANNEL_ID or configure it in Admin Panel → 📡 Secretary Mode.',
+      error: 'Secretary Mode is inactive. Configure a dedicated private admin channel ID (-100...) in Admin Panel → 📡 Secretary Mode to enable it.',
     };
   }
 
@@ -80,12 +99,19 @@ export function parseSecretaryChannelInput(rawInput) {
     return { ok: true, target: input, isNumeric: true };
   }
 
-  // Public @username
+  // Public @username (block @pnarewards / public update channel)
   if (/^@[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(input)) {
+    if (isBlockedPublicUpdateChannel(input, env)) {
+      return {
+        ok: false,
+        error:
+          'Private Secretary Mode logs cannot be sent to the public @pnarewards update channel. Use a dedicated private admin channel numeric ID (-100...).',
+      };
+    }
     return { ok: true, target: input, isNumeric: false };
   }
 
-  // Telegram URL handling: accept ONLY public https://t.me/<username>, REJECT invite links
+  // Telegram URL handling: accept ONLY non-public-update https://t.me/<username>, REJECT invite links
   if (/^https?:\/\/(t\.me|telegram\.me|telegram\.dog)\//i.test(input)) {
     try {
       const parsed = new URL(input);
@@ -99,7 +125,15 @@ export function parseSecretaryChannelInput(rawInput) {
         };
       }
       if (/^[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(seg)) {
-        return { ok: true, target: `@${seg}`, isNumeric: false };
+        const atTarget = `@${seg}`;
+        if (isBlockedPublicUpdateChannel(atTarget, env)) {
+          return {
+            ok: false,
+            error:
+              'Private Secretary Mode logs cannot be sent to the public @pnarewards update channel. Use a dedicated private admin channel numeric ID (-100...).',
+          };
+        }
+        return { ok: true, target: atTarget, isNumeric: false };
       }
     } catch {
       // fall through
@@ -109,7 +143,7 @@ export function parseSecretaryChannelInput(rawInput) {
   return {
     ok: false,
     error:
-      'Invalid channel identifier. Provide a numeric channel ID (e.g. -1001234567890) or a public channel @username (e.g. @pnarewards).',
+      'Invalid channel identifier. Provide a private admin channel numeric ID (e.g. -1001234567890).',
   };
 }
 
@@ -137,7 +171,7 @@ export async function verifySecretaryChannel(env, explicitInput = null) {
       ? String(explicitInput).trim()
       : current.channelInput || getConfiguredLogChannelId(env);
 
-  const parsed = parseSecretaryChannelInput(rawInput);
+  const parsed = parseSecretaryChannelInput(rawInput, env);
   const now = Date.now();
 
   if (!parsed.ok) {
@@ -174,6 +208,18 @@ export async function verifySecretaryChannel(env, explicitInput = null) {
   const resolvedChatId = String(chat.id);
   const channelTitle = chat.title || current.channelTitle || 'PnA X Logs';
   const channelUsername = chat.username ? `@${chat.username}` : '';
+
+  if (isBlockedPublicUpdateChannel(channelUsername, env)) {
+    const errMsg =
+      'Refused: private Secretary Mode logs cannot be posted to the public @pnarewards update channel.';
+    const updated = await saveSecretaryConfig(env, {
+      enabled: false,
+      verifiedAdmin: false,
+      lastVerifyAttemptAt: now,
+      lastError: errMsg,
+    });
+    return { ok: false, config: updated, error: errMsg };
+  }
 
   const botId = await resolveBotId(env);
   if (!botId) {
@@ -294,38 +340,26 @@ export async function emitSecretaryLog(env, { eventType, dedupKey, text }) {
       return { ok: true, deduplicated: true, logId: claim.id };
     }
 
-    if (cfg.manuallyDisabled) {
-      await markSecretaryLogSkipped(env, claim.id, 'Secretary Mode paused by owner');
-      return { ok: false, skipped: true, reason: 'manually_disabled', logId: claim.id };
+    if (cfg.manuallyDisabled || !cfg.enabled || !cfg.verifiedAdmin || !cfg.resolvedChatId) {
+      await markSecretaryLogSkipped(
+        env,
+        claim.id,
+        cfg.manuallyDisabled ? 'Secretary Mode paused by owner' : 'Secretary Mode is inactive'
+      );
+      return { ok: false, skipped: true, reason: 'secretary_inactive', logId: claim.id };
     }
 
-    // Auto-verify once when channel is configured and not yet verified (throttled)
-    if (!cfg.enabled || !cfg.verifiedAdmin || !cfg.resolvedChatId) {
-      if (!targetHint) {
-        await markSecretaryLogFailed(env, claim.id, {
-          channelId: '',
-          errorMessage: 'PNA_LOG_CHANNEL_ID is not configured.',
-        });
-        return { ok: false, reason: 'not_configured', logId: claim.id };
-      }
-
-      const recentlyTried =
-        cfg.lastVerifyAttemptAt && now - cfg.lastVerifyAttemptAt < AUTO_VERIFY_THROTTLE_MS;
-      if (!recentlyTried) {
-        const ver = await verifySecretaryChannel(env, cfg.channelInput || targetHint);
-        cfg = ver.config;
-      }
-
-      if (!cfg.enabled || !cfg.verifiedAdmin || !cfg.resolvedChatId) {
-        await markSecretaryLogFailed(env, claim.id, {
-          channelId: targetHint,
-          errorMessage: redactSecrets(
-            cfg.lastError || 'Bot is not verified as administrator in PnA X Logs.',
-            env
-          ),
-        });
-        return { ok: false, reason: 'not_verified_admin', logId: claim.id };
-      }
+    if (
+      isBlockedPublicUpdateChannel(cfg.channelInput, env) ||
+      isBlockedPublicUpdateChannel(cfg.channelUsername, env) ||
+      isBlockedPublicUpdateChannel(cfg.resolvedChatId, env)
+    ) {
+      await markSecretaryLogSkipped(
+        env,
+        claim.id,
+        'Blocked: private Secretary Mode logs cannot be sent to public @pnarewards channel'
+      );
+      return { ok: false, skipped: true, reason: 'blocked_public_channel', logId: claim.id };
     }
 
     const sendRes = await deliverToChannelWithRetry(env, cfg.resolvedChatId, safeText);
@@ -713,3 +747,69 @@ export async function logBotErrorEvent(env, { category = 'BOT_ERROR', summary, c
     text,
   });
 }
+
+export async function logSuspiciousDeviceEvent(
+  env,
+  {
+    user,
+    verificationId,
+    reviewId = '',
+    verdict,
+    riskScore,
+    reasons = [],
+    matchedUserIds = [],
+    referrerId = '',
+    strictFpPrefix = '',
+  }
+) {
+  const reasonCodes = (reasons || [])
+    .slice(0, 4)
+    .map((r) => escapeHtml(r.code || String(r)))
+    .join(', ');
+  const matchedLine = matchedUserIds.length
+    ? `👥 <b>Matched Accounts:</b> ${matchedUserIds.slice(0, 6).map((id) => `<code>${escapeHtml(id)}</code>`).join(', ')}\n`
+    : '';
+  const refLine = referrerId
+    ? `🔗 <b>Pending Referrer:</b> <code>${escapeHtml(referrerId)}</code> (held for review)\n`
+    : '';
+  const reviewLine = reviewId ? `🆔 <b>Review ID:</b> <code>${escapeHtml(reviewId)}</code>\n` : '';
+
+  const text =
+    `📡 <b>PnA X Logs — 🛡️ SUSPICIOUS DEVICE FLAGGED</b>\n` +
+    `${DIVIDER}\n` +
+    `👤 <b>User:</b> ${escapeHtml(formatUserName(user))} [<code>${escapeHtml(user?.id || '')}</code>]\n` +
+    `📌 <b>Verdict:</b> <b>${escapeHtml(String(verdict || '').toUpperCase())}</b> (Risk: <b>${riskScore}/100</b>)\n` +
+    `🧬 <b>Device Hash:</b> <code>${escapeHtml(strictFpPrefix)}…</code>\n` +
+    `${matchedLine}` +
+    `${refLine}` +
+    `${reviewLine}` +
+    `⚠️ <b>Signals:</b> ${reasonCodes || 'N/A'}\n` +
+    `🕒 <b>Date & Time:</b> ${formatIST(Date.now(), env)}`;
+
+  return emitSecretaryLog(env, {
+    eventType: 'SUSPICIOUS_DEVICE_FLAGGED',
+    dedupKey: `dev_flag:${verificationId}`,
+    text,
+  });
+}
+
+export async function logReferralReviewDecisionEvent(env, { review, adminId, decision, creditSummary }) {
+  const isApproved = String(decision).toUpperCase() === 'APPROVED';
+  const text =
+    `📡 <b>PnA X Logs — ${isApproved ? '✅ REFERRAL REVIEW APPROVED' : '❌ REFERRAL REVIEW REJECTED'}</b>\n` +
+    `${DIVIDER}\n` +
+    `🆔 <b>Review ID:</b> <code>${escapeHtml(review.id)}</code>\n` +
+    `👤 <b>Referred User:</b> <code>${escapeHtml(review.referredUserId)}</code>\n` +
+    `👑 <b>Referrer:</b> <code>${escapeHtml(review.referrerId)}</code>\n` +
+    `⚠️ <b>Risk Score:</b> ${review.riskScore}/100\n` +
+    `👮 <b>Admin ID:</b> <code>${escapeHtml(adminId)}</code>\n` +
+    `📌 <b>Outcome:</b> ${creditSummary}\n` +
+    `🕒 <b>Date & Time:</b> ${formatIST(Date.now(), env)}`;
+
+  return emitSecretaryLog(env, {
+    eventType: isApproved ? 'REFERRAL_REVIEW_APPROVED' : 'REFERRAL_REVIEW_REJECTED',
+    dedupKey: `ref_rev:${review.id}:${String(decision).toLowerCase()}`,
+    text,
+  });
+}
+

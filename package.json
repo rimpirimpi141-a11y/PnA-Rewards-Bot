@@ -4,17 +4,24 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "npx wrangler dev",
+    "dev": "tsx server.ts",
+    "start": "node server.ts",
+    "dev:worker": "npx wrangler dev",
     "deploy": "npx wrangler deploy",
     "tail": "npx wrangler tail",
-    "build": "esbuild src/index.js --bundle --format=esm --target=es2022 --outfile=dist/index.js",
+    "build": "vite build && npm run build:worker",
+    "build:miniapp": "vite build",
+    "build:worker": "esbuild src/index.js --bundle --format=esm --target=es2022 --outfile=dist/index.js",
     "lint": "node scripts/check-syntax.js && tsc --noEmit",
+    "test:device-verify": "node scripts/verify-device-verification.mjs",
     "webhook:set": "node scripts/set-webhook.js",
     "webhook:info": "node scripts/webhook-info.js",
     "db:migrate:local": "npx wrangler d1 migrations apply pna-rewards-db --local",
     "db:migrate:remote": "npx wrangler d1 migrations apply pna-rewards-db --remote",
     "db:list:remote": "npx wrangler d1 migrations list pna-rewards-db --remote",
-    "clean": "rm -rf dist"
+    "db:integrity:remote": "npx wrangler d1 execute pna-rewards-db --remote --file=scripts/d1-integrity-check.sql",
+    "db:apply:0002:remote": "npx wrangler d1 execute pna-rewards-db --remote --file=migrations/0002_device_verification.sql",
+    "clean": "rm -rf dist dist-miniapp"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

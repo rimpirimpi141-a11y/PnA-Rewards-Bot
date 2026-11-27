@@ -92,6 +92,13 @@ import {
 } from './secretary.js';
 import { handleAdminStatistics } from './statistics.js';
 import {
+  handleAdminDeviceClustersList,
+  handleAdminDeviceVerifyMenu,
+  handleAdminReferralReviewDecision,
+  handleAdminReferralReviewDetail,
+  handleAdminReferralReviewsList,
+} from './device-admin.js';
+import {
   handleAdminAddVoucherCategory,
   handleAdminAddVoucherMenu,
   handleAdminBulkVoucherInput,
@@ -1089,6 +1096,45 @@ export async function handleAdminCallback(env, callbackQuery, ctx) {
 
   if (data === 'adm:sec_set_ch') {
     await handleAdminSecretaryChannelPrompt(env, callbackQuery);
+    return;
+  }
+
+  // Device Verification & Suspicious Referral Reviews callbacks
+  if (data === 'adm:dv:menu') {
+    await answerCallbackQuery(env, callbackQuery.id);
+    await handleAdminDeviceVerifyMenu(env, adminId, chatId, msgId);
+    return;
+  }
+
+  if (data.startsWith('adm:dv:reviews:')) {
+    const page = Number(data.split(':')[3] || 1);
+    await answerCallbackQuery(env, callbackQuery.id);
+    await handleAdminReferralReviewsList(env, adminId, chatId, page, msgId);
+    return;
+  }
+
+  if (data.startsWith('adm:dv:clusters:')) {
+    const page = Number(data.split(':')[3] || 1);
+    await answerCallbackQuery(env, callbackQuery.id);
+    await handleAdminDeviceClustersList(env, adminId, chatId, page, msgId);
+    return;
+  }
+
+  if (data.startsWith('adm:dv:rev_view:')) {
+    const reviewId = data.slice('adm:dv:rev_view:'.length);
+    await handleAdminReferralReviewDetail(env, callbackQuery, reviewId);
+    return;
+  }
+
+  if (data.startsWith('adm:dv:rev_approve:')) {
+    const reviewId = data.slice('adm:dv:rev_approve:'.length);
+    await handleAdminReferralReviewDecision(env, callbackQuery, reviewId, 'approved');
+    return;
+  }
+
+  if (data.startsWith('adm:dv:rev_reject:')) {
+    const reviewId = data.slice('adm:dv:rev_reject:'.length);
+    await handleAdminReferralReviewDecision(env, callbackQuery, reviewId, 'rejected');
     return;
   }
 

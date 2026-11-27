@@ -74,32 +74,33 @@ export function adminReplyKeyboard() {
       ],
       [
         { text: ADMIN_BUTTONS.MANAGE_BALANCE, style: SUCCESS },
+        { text: ADMIN_BUTTONS.DEVICE_VERIFY, style: PRIMARY },
+      ],
+      [
         { text: ADMIN_BUTTONS.SECRETARY_MODE, style: PRIMARY },
-      ],
-      [
         { text: ADMIN_BUTTONS.FORCE_CHANNELS, style: SUCCESS },
+      ],
+      [
         { text: ADMIN_BUTTONS.SETTINGS, style: PRIMARY },
-      ],
-      [
         { text: ADMIN_BUTTONS.USERS_LIST, style: PRIMARY },
+      ],
+      [
         { text: ADMIN_BUTTONS.ADD_ADMIN, style: SUCCESS },
-      ],
-      [
         { text: ADMIN_BUTTONS.STATISTICS, style: PRIMARY },
+      ],
+      [
         { text: ADMIN_BUTTONS.BROADCAST, style: SUCCESS },
-      ],
-      [
         { text: ADMIN_BUTTONS.VOUCHER_STOCK, style: SUCCESS },
+      ],
+      [
         { text: ADMIN_BUTTONS.VOUCHER_HISTORY, style: PRIMARY },
-      ],
-      [
         { text: ADMIN_BUTTONS.LOW_STOCK, style: DANGER },
-        { text: ADMIN_BUTTONS.MAINTENANCE, style: DANGER },
       ],
       [
+        { text: ADMIN_BUTTONS.MAINTENANCE, style: DANGER },
         { text: ADMIN_BUTTONS.ACTIVITY_LOGS, style: PRIMARY },
-        { text: MENU_BUTTONS.MAIN_MENU, style: PRIMARY },
       ],
+      [{ text: MENU_BUTTONS.MAIN_MENU, style: PRIMARY }],
     ],
     resize_keyboard: true,
     is_persistent: true,
@@ -155,6 +156,28 @@ export function forceJoinKeyboard(channels) {
 
   inline_keyboard.push([{ text: '✅ VERIFY MEMBERSHIP', callback_data: 'fj:verify' }]);
   return { inline_keyboard };
+}
+
+/**
+ * Post-force-join Device Verification Mini App keyboard.
+ * Uses Telegram's native `web_app` button so Telegram injects signed `initData`.
+ */
+export function deviceVerificationKeyboard(miniAppUrl, status = 'unverified') {
+  const rows = [];
+  if (miniAppUrl) {
+    const cta =
+      status === 'pending_review'
+        ? '🔄 Retry Device Verification (Mini App)'
+        : '🛡️ Open Mini App & Verify Device';
+    rows.push([
+      {
+        text: cta,
+        web_app: { url: miniAppUrl },
+      },
+    ]);
+  }
+  rows.push([{ text: '✅ Check Verification Status', callback_data: 'dv:status' }]);
+  return { inline_keyboard: rows };
 }
 
 export function balanceInlineKeyboard() {

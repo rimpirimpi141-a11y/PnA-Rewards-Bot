@@ -34,11 +34,13 @@ import {
   handleDailyBonusView,
 } from './handlers/bonus.js';
 import { handleAdminBroadcastStart } from './handlers/broadcast.js';
+import { handleAdminDeviceVerifyMenu } from './handlers/device-admin.js';
 import { handleAdminForceChannelsMenu } from './handlers/forcejoin.js';
 import { handleReferralListView, handleReferralView } from './handlers/referral.js';
 import { handleAdminSecretaryMenu } from './handlers/secretary.js';
 import {
   ensureUserAccess,
+  handleDeviceVerifyStatusCallback,
   handleStartCommand,
   handleVerifyForceJoinCallback,
   sendMainMenu,
@@ -64,6 +66,11 @@ import {
   handleWithdrawMenu,
 } from './handlers/withdrawal.js';
 import { adminReplyKeyboard } from './keyboards.js';
+import {
+  handleDeviceVerifySession,
+  handleDeviceVerifyStatus,
+  handleDeviceVerifySubmit,
+} from './services/device-verification.js';
 import {
   handleIncomingJoinRequest,
   isActiveChannelMember,
@@ -156,6 +163,12 @@ async function handleCallbackQuery(env, callbackQuery, ctx) {
   // Force-join verification
   if (data === 'fj:verify') {
     await handleVerifyForceJoinCallback(env, callbackQuery);
+    return;
+  }
+
+  // Device verification status check
+  if (data === 'dv:status') {
+    await handleDeviceVerifyStatusCallback(env, callbackQuery);
     return;
   }
 
@@ -312,6 +325,9 @@ async function tryHandleAdminReplyButton(env, tgUser, chatId, text) {
       return true;
     case ADMIN_BUTTONS.MANAGE_BALANCE:
       await handleAdminManageBalanceStart(env, userId, chatId);
+      return true;
+    case ADMIN_BUTTONS.DEVICE_VERIFY:
+      await handleAdminDeviceVerifyMenu(env, userId, chatId);
       return true;
     case ADMIN_BUTTONS.SECRETARY_MODE:
       await handleAdminSecretaryMenu(env, userId, chatId);
@@ -540,6 +556,19 @@ export default {
       }
 
       return jsonResponse({ ok: true });
+    }
+
+    // Internal HMAC-authenticated Mini App Device Verification API (called by Cloud Run BFF)
+    if (request.method === 'POST' && url.pathname === '/api/internal/device-verify/session') {
+      return handleDeviceVerifySession(request, env);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/internal/device-verify/submit') {
+      return handleDeviceVerifySubmit(request, env);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/internal/device-verify/status') {
+      return handleDeviceVerifyStatus(request, env);
     }
 
     return jsonResponse({ ok: false, error: 'Not Found' }, 404);

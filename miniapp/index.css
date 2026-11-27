@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+:root {
+  --pna-bg: #0b1117;
+  --pna-surface: #121a23;
+  --pna-surface-2: #182330;
+  --pna-border: rgba(255, 255, 255, 0.08);
+  --pna-text: #f3f7fa;
+  --pna-muted: #93a3b5;
+  --pna-accent: #10b981;
+  --pna-accent-strong: #059669;
+  --pna-warn: #f59e0b;
+  --pna-danger: #ef4444;
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+[data-theme='light'] {
+  --pna-bg: #f4f7f9;
+  --pna-surface: #ffffff;
+  --pna-surface-2: #edf2f6;
+  --pna-border: rgba(15, 23, 42, 0.09);
+  --pna-text: #0f172a;
+  --pna-muted: #526375;
+  --pna-accent: #059669;
+  --pna-accent-strong: #047857;
+}
+
+html,
+body,
+#root {
+  min-height: 100dvh;
+  background-color: var(--pna-bg);
+  color: var(--pna-text);
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+}
+
+.font-mono-code {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.safe-top {
+  padding-top: max(1rem, env(safe-area-inset-top));
+}
+
+.safe-bottom {
+  padding-bottom: max(1.25rem, env(safe-area-inset-bottom));
+}

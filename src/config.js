@@ -49,6 +49,7 @@ export const DEFAULT_ADMIN_PERMISSIONS = {
   manageLowStock: true,
   manageMaintenance: true,
   viewLogs: true,
+  manageDeviceVerify: true,
   manageSecretary: false, // Owner-only configuration
   manageAdmins: false, // Strictly Owner-only
 };
@@ -65,6 +66,7 @@ export const OWNER_PERMISSIONS = {
   manageLowStock: true,
   manageMaintenance: true,
   viewLogs: true,
+  manageDeviceVerify: true,
   manageSecretary: true,
   manageAdmins: true,
 };
@@ -116,6 +118,7 @@ export const ADMIN_BUTTONS = {
   ADD_VOUCHER: '➕ Add Voucher',
   PENDING_REQUESTS: '📋 Pending Requests',
   MANAGE_BALANCE: '💰 Manage User Balance',
+  DEVICE_VERIFY: '🛡️ Device Verification',
   SECRETARY_MODE: '📡 Secretary Mode',
   FORCE_CHANNELS: '📢 Force Channels',
   SETTINGS: '⚙️ Settings',
@@ -153,6 +156,25 @@ export const ACTIVITY_ACTIONS = {
   USER_STATUS_CHANGED: 'USER_STATUS_CHANGED',
   TASK_CREATED: 'TASK_CREATED',
   TASK_REVIEWED: 'TASK_REVIEWED',
+  REFERRAL_REVIEW_APPROVED: 'REFERRAL_REVIEW_APPROVED',
+  REFERRAL_REVIEW_REJECTED: 'REFERRAL_REVIEW_REJECTED',
+};
+
+export const DEVICE_VERIFICATION_STATUS = {
+  UNVERIFIED: 'unverified',
+  VERIFIED: 'verified',
+  PENDING_REVIEW: 'pending_review',
+  REJECTED: 'rejected',
+  GRANDFATHERED: 'grandfathered',
+};
+
+export const DEVICE_RISK_THRESHOLDS = {
+  PENDING_REVIEW: 50,
+  REJECTED: 85,
+  INIT_DATA_MAX_AGE_SECONDS: 300,
+  CHALLENGE_TTL_MS: 5 * 60 * 1000,
+  BRIDGE_MAX_SKEW_MS: 60 * 1000,
+  TOKEN_TTL_SECONDS: 15 * 60,
 };
 
 export function getOwnerId(env) {
@@ -171,6 +193,43 @@ export function getWebhookPath(env) {
 
 export function getConfiguredLogChannelId(env) {
   return env?.PNA_LOG_CHANNEL_ID ? String(env.PNA_LOG_CHANNEL_ID).trim() : '';
+}
+
+export function getMiniAppUrl(env) {
+  const raw = env?.MINIAPP_URL ? String(env.MINIAPP_URL).trim() : '';
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'https:') return '';
+    return parsed.toString();
+  } catch {
+    return '';
+  }
+}
+
+export function getMiniAppAllowedOrigins(env) {
+  const raw = env?.MINIAPP_ALLOWED_ORIGINS ? String(env.MINIAPP_ALLOWED_ORIGINS) : '';
+  const list = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const primary = getMiniAppUrl(env);
+  if (primary) {
+    try {
+      const origin = new URL(primary).origin;
+      if (!list.includes(origin)) list.push(origin);
+    } catch {
+      // ignore invalid URL
+    }
+  }
+  return list;
+}
+
+export function isDeviceVerificationEnabled(env) {
+  const raw = env?.DEVICE_VERIFICATION_ENABLED;
+  if (raw === undefined || raw === null || raw === '') return true;
+  const norm = String(raw).trim().toLowerCase();
+  return norm !== 'false' && norm !== '0' && norm !== 'off';
 }
 
 /**
