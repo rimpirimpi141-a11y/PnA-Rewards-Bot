@@ -43,6 +43,7 @@ import {
   isDeviceVerificationEnabled,
 } from '../config.js';
 import {
+  assertDB,
   consumeVerificationChallenge,
   countRecentDistinctUsersByIp,
   countRecentVerificationAttemptsByUser,
@@ -1111,6 +1112,32 @@ function extractClientNetwork(bodyNetwork, request) {
 }
 
 /**
+ * Shared helper to resolve authoritative verification state and generation alignment.
+ * Every user (including verified, grandfathered, admins, and owners) must satisfy
+ * both verified status and last_verified_generation >= currentVerificationGeneration (gen 2).
+ * Never automatically upgrades user generation.
+ */
+export async function resolveVerificationState(user, env, _adminUser = false) {
+  if (!isDeviceVerificationEnabled(env)) {
+    return { verified: true, requiredGen: 2, userGen: Number(user?.lastVerifiedGeneration || 0), status: user?.deviceVerificationStatus || 'verified' };
+  }
+  if (!user) {
+    return { verified: false, requiredGen: 2, userGen: 0, status: 'unverified' };
+  }
+  const settings = await getSettings(env);
+  const requiredGen = Number(settings.currentVerificationGeneration || 2);
+  const userGen = Number(user.lastVerifiedGeneration || 0);
+  const status = user.deviceVerificationStatus || DEVICE_VERIFICATION_STATUS.UNVERIFIED;
+
+  const isVerifiedStatus =
+    status === DEVICE_VERIFICATION_STATUS.VERIFIED ||
+    status === DEVICE_VERIFICATION_STATUS.GRANDFATHERED;
+
+  const verified = isVerifiedStatus && userGen >= requiredGen;
+  return { verified, requiredGen, userGen, status };
+}
+
+/**
  * POST /api/internal/device-verify/session
  * Validates Telegram WebApp `initData`, confirms user force-join status,
  * and issues a single-use short-lived challenge nonce stored in D1.
@@ -1188,13 +1215,8 @@ export async function handleDeviceVerifySession(request, env) {
     );
   }
 
-  const alreadyVerified =
-    adminUser ||
-    !isDeviceVerificationEnabled(env) ||
-    user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.VERIFIED ||
-    user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.GRANDFATHERED;
-
-  if (alreadyVerified) {
+  const state = await resolveVerificationState(user, env, adminUser);
+  if (state.verified) {
     const token = await signVerificationToken(env, {
       jti: generateId('VTKN'),
       uid: user.id,
@@ -1283,10 +1305,8 @@ export async function handleDeviceVerifyObserve(request, env) {
   const { user } = await createOrUpdateUserFromTelegram(env, tgUser);
   const adminUser = await isAdmin(userId, env);
 
-  const isEligibleForObserve =
-    adminUser ||
-    user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.GRANDFATHERED ||
-    user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.VERIFIED;
+  const state = await resolveVerificationState(user, env, adminUser);
+  const isEligibleForObserve = state.verified || adminUser;
 
   if (!isEligibleForObserve) {
     return workerJson({
@@ -1404,18 +1424,9 @@ export async function handleDeviceVerifySubmit(request, env) {
     );
   }
 
-  // Short-circuit if user is already verified or grandfathered (still record observation silently!)
-  if (
-    user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.VERIFIED ||
-    user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.GRANDFATHERED
-  ) {
-    const settings = await getSettings(env);
-    const requiredGen = Number(settings.currentVerificationGeneration || 2);
-    if (Number(user.lastVerifiedGeneration || 0) < requiredGen) {
-      const db = assertDB(env);
-      await db.prepare('UPDATE users SET last_verified_generation = ? WHERE telegram_id = ?').bind(requiredGen, userId).run();
-      user.lastVerifiedGeneration = requiredGen;
-    }
+  // Short-circuit only if user satisfies generation 2 verification state
+  const state = await resolveVerificationState(user, env, adminUser);
+  if (state.verified) {
     if (body.signals && typeof body.signals === 'object') {
       const obsNet = extractClientNetwork(body.clientNetwork, request);
       const obsFp = await normalizeAndHashSignals(body.signals, obsNet, env, body.installAnchor);
@@ -1700,6 +1711,8 @@ export async function handleDeviceVerifyStatus(request, env) {
     return workerJson({ ok: false, error: 'User not registered. Send /start in the bot first.' }, 404);
   }
 
+  const adminUser = await isAdmin(initCheck.user.id, env);
+  const state = await resolveVerificationState(user, env, adminUser);
   const [latest, review] = await Promise.all([
     getLatestUserDeviceVerification(env, user.id),
     getUserReferralReview(env, user.id),
@@ -1708,6 +1721,9 @@ export async function handleDeviceVerifyStatus(request, env) {
   return workerJson({
     ok: true,
     status: user.deviceVerificationStatus,
+    verified: state.verified,
+    requiredGen: state.requiredGen,
+    userGen: state.userGen,
     forceJoinVerified: Boolean(user.forceJoinVerified),
     verifiedAt: user.deviceVerifiedAt,
     latestVerificationId: latest?.id || null,
