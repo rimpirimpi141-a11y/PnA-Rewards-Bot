@@ -38,22 +38,18 @@ import { logNewUserEvent } from '../services/secretary.js';
 import { answerCallbackQuery, editMessageText, sendMessage } from '../telegram.js';
 
 /**
- * Check whether a user satisfies the server-side device verification requirement
- * and current verification generation. Admins and owners are also required to verify.
+ * Check whether a user satisfies the server-side device verification requirement.
+ * Admins and pre-existing grandfathered/verified users pass seamlessly.
  */
-export async function isUserDeviceVerified(user, env, isAdminUser = false) {
+export function isUserDeviceVerified(user, env, isAdminUser = false) {
+  if (isAdminUser) return true;
   if (!isDeviceVerificationEnabled(env)) return true;
   if (!user) return false;
-  const settings = await getSettings(env);
-  const requiredGen = Number(settings.currentVerificationGeneration || 2);
-  const userGen = Number(user.lastVerifiedGeneration || 0);
   const status = user.deviceVerificationStatus || DEVICE_VERIFICATION_STATUS.UNVERIFIED;
-
-  const isVerifiedStatus =
+  return (
     status === DEVICE_VERIFICATION_STATUS.VERIFIED ||
-    status === DEVICE_VERIFICATION_STATUS.GRANDFATHERED;
-
-  return isVerifiedStatus && userGen >= requiredGen;
+    status === DEVICE_VERIFICATION_STATUS.GRANDFATHERED
+  );
 }
 
 /**

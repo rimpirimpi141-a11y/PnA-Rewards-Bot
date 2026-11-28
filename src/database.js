@@ -78,7 +78,7 @@ function mapUserRow(row) {
     activePendingWithdrawalId: row.active_pending_withdrawal_id || null,
     forceJoinVerified: Boolean(row.force_join_verified),
     withdrawalCount: toNonNegInt(row.withdrawal_count),
-    lastVerifiedGeneration: toNonNegInt(row.last_verified_generation),
+    lastVerifiedGeneration: row.last_verified_generation !== undefined && row.last_verified_generation !== null ? toNonNegInt(row.last_verified_generation) : 0,
     customMinWithdrawalPaise:
       row.custom_min_withdrawal_paise !== null && row.custom_min_withdrawal_paise !== undefined
         ? toInt(row.custom_min_withdrawal_paise)
@@ -3136,11 +3136,10 @@ export async function recordDeviceVerificationAtomic(
          SET device_verification_status = ?,
              device_verified_at = CASE WHEN ? IS NOT NULL THEN ? ELSE device_verified_at END,
              device_risk_score = ?,
-             device_fingerprint_hash = ?,
-             last_verified_generation = CASE WHEN ? = 'verified' THEN COALESCE((SELECT json_extract(value_json, '$.currentVerificationGeneration') FROM settings WHERE key = 'global'), 2) ELSE last_verified_generation END
+             device_fingerprint_hash = ?
          WHERE telegram_id = ?`
       )
-      .bind(String(verdict), verifiedAt, verifiedAt, safeScore, String(strictFpHash), String(verdict), uid),
+      .bind(String(verdict), verifiedAt, verifiedAt, safeScore, String(strictFpHash), uid),
   ];
 
   const signalStatements = dedupedLinks.map((item) =>
