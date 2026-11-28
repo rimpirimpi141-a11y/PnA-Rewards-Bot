@@ -3136,11 +3136,11 @@ export async function recordDeviceVerificationAtomic(
          SET device_verification_status = ?,
              device_verified_at = CASE WHEN ? IS NOT NULL THEN ? ELSE device_verified_at END,
              device_risk_score = ?,
-             device_fingerprint_hash = ?
-         WHERE telegram_id = ?
-           AND device_verification_status NOT IN ('verified', 'grandfathered')`
+             device_fingerprint_hash = ?,
+             last_verified_generation = CASE WHEN ? = 'verified' THEN COALESCE((SELECT json_extract(value_json, '$.currentVerificationGeneration') FROM settings WHERE key = 'global'), 2) ELSE last_verified_generation END
+         WHERE telegram_id = ?`
       )
-      .bind(String(verdict), verifiedAt, verifiedAt, safeScore, String(strictFpHash), uid),
+      .bind(String(verdict), verifiedAt, verifiedAt, safeScore, String(strictFpHash), String(verdict), uid),
   ];
 
   const signalStatements = dedupedLinks.map((item) =>

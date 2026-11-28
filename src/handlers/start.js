@@ -38,18 +38,22 @@ import { logNewUserEvent } from '../services/secretary.js';
 import { answerCallbackQuery, editMessageText, sendMessage } from '../telegram.js';
 
 /**
- * Check whether a user satisfies the server-side device verification requirement.
- * Admins and pre-existing grandfathered users pass seamlessly.
+ * Check whether a user satisfies the server-side device verification requirement
+ * and current verification generation. Admins and owners are also required to verify.
  */
-export function isUserDeviceVerified(user, env, isAdminUser = false) {
-  if (isAdminUser) return true;
+export async function isUserDeviceVerified(user, env, isAdminUser = false) {
   if (!isDeviceVerificationEnabled(env)) return true;
   if (!user) return false;
+  const settings = await getSettings(env);
+  const requiredGen = Number(settings.currentVerificationGeneration || 2);
+  const userGen = Number(user.lastVerifiedGeneration || 0);
   const status = user.deviceVerificationStatus || DEVICE_VERIFICATION_STATUS.UNVERIFIED;
-  return (
+
+  const isVerifiedStatus =
     status === DEVICE_VERIFICATION_STATUS.VERIFIED ||
-    status === DEVICE_VERIFICATION_STATUS.GRANDFATHERED
-  );
+    status === DEVICE_VERIFICATION_STATUS.GRANDFATHERED;
+
+  return isVerifiedStatus && userGen >= requiredGen;
 }
 
 /**
@@ -213,7 +217,7 @@ export async function ensureUserAccess(env, tgUser, chatId) {
   }
 
   // Enforce server-side device verification gate before unlocking bot menu or rewards
-  if (!isUserDeviceVerified(user, env, adminUser)) {
+  if (!(await isUserDeviceVerified(user, env, adminUser))) {
     await sendDeviceVerificationPrompt(env, chatId, user, null);
     return { allowed: false, user, isAdminUser: adminUser };
   }
@@ -293,7 +297,7 @@ export async function handleStartCommand(env, message, startPayload = '') {
   }
 
   // Step 2: Check server-side Mini App Device Verification before unlocking menu or referrals
-  if (!isUserDeviceVerified(user, env, adminUser)) {
+  if (!(await isUserDeviceVerified(user, env, adminUser))) {
     await sendDeviceVerificationPrompt(env, chatId, user, null);
     return;
   }
@@ -342,7 +346,7 @@ export async function handleVerifyForceJoinCallback(env, callbackQuery) {
   const freshUser = (await getUser(env, user.id)) || { ...user, forceJoinVerified: true };
 
   // Step 2 Gate: Do NOT unlock main menu or credit referral until device verification passes
-  if (!isUserDeviceVerified(freshUser, env, adminUser)) {
+  if (!(await isUserDeviceVerified(freshUser, env, adminUser))) {
     await sendDeviceVerificationPrompt(env, chatId, freshUser, msgId);
     return;
   }
@@ -384,7 +388,7 @@ export async function handleDeviceVerifyStatusCallback(env, callbackQuery) {
     return;
   }
 
-  if (!isUserDeviceVerified(user, env, adminUser)) {
+  if (!(await isUserDeviceVerified(user, env, adminUser))) {
     const statusLabel =
       user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.PENDING_REVIEW
         ? '⏳ Still under admin security review.'

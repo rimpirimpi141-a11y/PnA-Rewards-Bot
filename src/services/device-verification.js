@@ -1409,6 +1409,13 @@ export async function handleDeviceVerifySubmit(request, env) {
     user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.VERIFIED ||
     user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.GRANDFATHERED
   ) {
+    const settings = await getSettings(env);
+    const requiredGen = Number(settings.currentVerificationGeneration || 2);
+    if (Number(user.lastVerifiedGeneration || 0) < requiredGen) {
+      const db = assertDB(env);
+      await db.prepare('UPDATE users SET last_verified_generation = ? WHERE telegram_id = ?').bind(requiredGen, userId).run();
+      user.lastVerifiedGeneration = requiredGen;
+    }
     if (body.signals && typeof body.signals === 'object') {
       const obsNet = extractClientNetwork(body.clientNetwork, request);
       const obsFp = await normalizeAndHashSignals(body.signals, obsNet, env, body.installAnchor);

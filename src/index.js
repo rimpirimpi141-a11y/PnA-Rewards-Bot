@@ -173,6 +173,13 @@ async function handleCallbackQuery(env, callbackQuery, ctx) {
     return;
   }
 
+  // Global user access control (force-join + device verification generation check)
+  const access = await ensureUserAccess(env, tgUser, chatId);
+  if (!access.allowed) {
+    await answerCallbackQuery(env, callbackQuery.id, '🛡️ Device verification required to continue.', true);
+    return;
+  }
+
   // Admin workflows & item actions
   if (data.startsWith('adm:')) {
     await handleAdminCallback(env, callbackQuery, ctx);
@@ -355,6 +362,13 @@ async function handleMessage(env, message) {
     const parts = text.split(/\s+/);
     const payload = parts.length > 1 ? parts[1].trim() : '';
     await handleStartCommand(env, message, payload);
+    return;
+  }
+
+  // Global user access control (force-join + device verification generation check)
+  // for ANY message, command, menu button, or feature action (including admins and owner).
+  const access = await ensureUserAccess(env, tgUser, chatId);
+  if (!access.allowed) {
     return;
   }
 
