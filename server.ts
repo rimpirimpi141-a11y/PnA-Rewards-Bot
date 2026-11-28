@@ -8,6 +8,10 @@
 // Security guarantees:
 //  • Zero database credentials and zero BOT_TOKEN in this server or frontend.
 //  • Extracts real client IP via Express `trust proxy` (`X-Forwarded-For`).
+//  • Issues & verifies server-signed opaque WebView installation tokens
+//    (`pna_inst_v1.<id>.<hmac>`) via HttpOnly; Secure; SameSite=None cookie
+//    with redundant client WebView origin-storage fallback.
+//  • Never trusts unsigned or client-generated installation IDs.
 //  • Per-IP sliding-window rate limiting on all `/api/verify/*` endpoints.
 //  • Strict same-origin / allowlisted CORS and security headers.
 //  • Every Worker bridge call is HMAC-SHA256 signed with timestamp + nonce.
@@ -25,10 +29,12 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const IS_PROD = process.env.NODE_ENV === 'production';
 const DIST_DIR = path.resolve(__dirname, 'dist-miniapp');
+const INSTALL_COOKIE_NAME = 'pna_inst';
+const INSTALL_COOKIE_MAX_AGE_SEC = 365 * 24 * 60 * 60; // 1 year
 
 // Sliding-window in-memory IP rate limiter (Cloud Run instance scope)
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
-const RATE_LIMIT_MAX_REQUESTS = 25;
+const RATE_LIMIT_MAX_REQUESTS = 35;
 const ipHits = new Map<string, number[]>();
 
 function isRateLimited(ip: string): boolean {
@@ -43,7 +49,6 @@ function isRateLimited(ip: string): boolean {
   recent.push(now);
   ipHits.set(key, recent);
   if (ipHits.size > 5000) {
-    // Periodic bounded cleanup
     for (const [k, list] of ipHits.entries()) {
       if (!list.some((ts) => now - ts < RATE_LIMIT_WINDOW_MS)) {
         ipHits.delete(k);
@@ -69,6 +74,7 @@ function getAllowedOrigins(): Set<string> {
     process.env.APP_URL,
     process.env.MINIAPP_URL,
     ...(process.env.MINIAPP_ALLOWED_ORIGINS || '').split(','),
+    'https://p-a-rewards.ai.studio',
     'https://ais-pre-5anw25hqtptdicmzho3ex7-704214232389.asia-east1.run.app',
     'https://ais-dev-5anw25hqtptdicmzho3ex7-704214232389.asia-east1.run.app',
   ];
@@ -99,6 +105,148 @@ function getWorkerConfig() {
     }
   }
   return { workerUrl: validUrl, bridgeSecret };
+}
+
+// ----------------------------------------------------------------------------
+// Server-Signed WebView Installation Token (`pna_inst_v1.<id>.<hmac>`)
+// ----------------------------------------------------------------------------
+// Uses a domain-separated key derived from MINIAPP_BRIDGE_SECRET so BOTH
+// Cloud Run and Cloudflare Worker independently verify every token signature.
+// Unsigned, forged, or client-generated tokens are NEVER accepted.
+// ----------------------------------------------------------------------------
+
+function deriveInstallTokenKey(bridgeSecret: string): Buffer {
+  return crypto
+    .createHmac('sha256', bridgeSecret)
+    .update('pna-rewards:install-token-key:v1')
+    .digest();
+}
+
+export function mintSignedInstallToken(bridgeSecret: string): string {
+  const tokenId = crypto.randomBytes(16).toString('hex');
+  const key = deriveInstallTokenKey(bridgeSecret);
+  const sig = crypto
+    .createHmac('sha256', key)
+    .update(`pna_inst_v1.${tokenId}`)
+    .digest('hex');
+  return `pna_inst_v1.${tokenId}.${sig}`;
+}
+
+export function verifySignedInstallToken(
+  rawToken: unknown,
+  bridgeSecret: string
+): { valid: boolean; tokenId: string; token: string } {
+  const clean = typeof rawToken === 'string' ? rawToken.trim() : '';
+  if (!clean || !bridgeSecret) return { valid: false, tokenId: '', token: '' };
+  const match = clean.match(/^pna_inst_v1\.([a-f0-9]{24,64})\.([a-f0-9]{64})$/i);
+  if (!match) return { valid: false, tokenId: '', token: '' };
+  const tokenId = match[1].toLowerCase();
+  const providedSigHex = match[2].toLowerCase();
+  const key = deriveInstallTokenKey(bridgeSecret);
+  const expectedSig = crypto
+    .createHmac('sha256', key)
+    .update(`pna_inst_v1.${tokenId}`)
+    .digest();
+  const providedSig = Buffer.from(providedSigHex, 'hex');
+  if (
+    expectedSig.length !== providedSig.length ||
+    !crypto.timingSafeEqual(expectedSig, providedSig)
+  ) {
+    return { valid: false, tokenId: '', token: '' };
+  }
+  return { valid: true, tokenId, token: `pna_inst_v1.${tokenId}.${providedSigHex}` };
+}
+
+function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!cookieHeader) return out;
+  for (const part of cookieHeader.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    const val = part.slice(idx + 1).trim();
+    if (key) {
+      try {
+        out[key] = decodeURIComponent(val);
+      } catch {
+        out[key] = val;
+      }
+    }
+  }
+  return out;
+}
+
+function setInstallCookie(req: Request, res: Response, signedToken: string): void {
+  const isHttps =
+    IS_PROD ||
+    req.secure ||
+    String(req.headers['x-forwarded-proto'] || '')
+      .split(',')[0]
+      ?.trim() === 'https';
+
+  const parts = [
+    `${INSTALL_COOKIE_NAME}=${encodeURIComponent(signedToken)}`,
+    'Path=/',
+    `Max-Age=${INSTALL_COOKIE_MAX_AGE_SEC}`,
+    'HttpOnly',
+  ];
+  if (isHttps) {
+    parts.push('Secure', 'SameSite=None');
+  } else {
+    parts.push('SameSite=Lax');
+  }
+  res.setHeader('Set-Cookie', parts.join('; '));
+  res.setHeader('Cache-Control', 'no-store, private');
+}
+
+interface ResolvedInstallAnchor {
+  cookieToken: string;
+  storageToken: string;
+  canonicalToken: string;
+  tamperedCookieToken: boolean;
+  tamperedStorageToken: boolean;
+  wasNewlyMinted: boolean;
+}
+
+function resolveInstallationAnchor(
+  req: Request,
+  res: Response,
+  bridgeSecret: string,
+  rawStorageToken: unknown
+): ResolvedInstallAnchor {
+  const cookies = parseCookies(req.headers.cookie);
+  const rawCookie = String(cookies[INSTALL_COOKIE_NAME] || '').trim();
+  const rawStorage = typeof rawStorageToken === 'string' ? rawStorageToken.trim() : '';
+
+  const cookieCheck = verifySignedInstallToken(rawCookie, bridgeSecret);
+  const storageCheck = verifySignedInstallToken(rawStorage, bridgeSecret);
+
+  const tamperedCookieToken = Boolean(rawCookie && !cookieCheck.valid);
+  const tamperedStorageToken = Boolean(rawStorage && !storageCheck.valid);
+
+  let canonicalToken = '';
+  let wasNewlyMinted = false;
+
+  if (cookieCheck.valid) {
+    canonicalToken = cookieCheck.token;
+  } else if (storageCheck.valid) {
+    canonicalToken = storageCheck.token;
+  } else {
+    canonicalToken = mintSignedInstallToken(bridgeSecret);
+    wasNewlyMinted = true;
+  }
+
+  // Always refresh HttpOnly cookie so cleared cookies self-heal from valid WebView storage
+  setInstallCookie(req, res, canonicalToken);
+
+  return {
+    cookieToken: cookieCheck.valid ? cookieCheck.token : '',
+    storageToken: storageCheck.valid ? storageCheck.token : '',
+    canonicalToken,
+    tamperedCookieToken,
+    tamperedStorageToken,
+    wasNewlyMinted,
+  };
 }
 
 function buildBridgeHeaders(
@@ -133,7 +281,11 @@ async function forwardToWorker(
   req: Request,
   res: Response,
   workerPath: string,
-  payloadBuilder: (body: Record<string, unknown>, clientNetwork: Record<string, unknown>) => Record<string, unknown>
+  payloadBuilder: (
+    body: Record<string, unknown>,
+    clientNetwork: Record<string, unknown>,
+    installAnchor: ResolvedInstallAnchor
+  ) => Record<string, unknown>
 ) {
   const clientIp = extractClientIp(req);
   if (isRateLimited(clientIp)) {
@@ -156,6 +308,16 @@ async function forwardToWorker(
     return;
   }
 
+  const incomingBody =
+    req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : {};
+
+  const installAnchor = resolveInstallationAnchor(
+    req,
+    res,
+    bridgeSecret,
+    incomingBody.storageInstallToken
+  );
+
   const countryCode = String(
     req.headers['x-appengine-country'] || req.headers['cf-ipcountry'] || ''
   ).slice(0, 16);
@@ -165,12 +327,12 @@ async function forwardToWorker(
   const clientNetwork = {
     ip: clientIp,
     countryCode,
-    proxyHint: Boolean(viaHeader && /proxy|squid|tor/i.test(viaHeader)) || /for=unknown/i.test(forwardedHeader),
+    proxyHint:
+      Boolean(viaHeader && /proxy|squid|tor/i.test(viaHeader)) ||
+      /for=unknown/i.test(forwardedHeader),
   };
 
-  const incomingBody =
-    req.body && typeof req.body === 'object' ? (req.body as Record<string, unknown>) : {};
-  const outboundPayload = payloadBuilder(incomingBody, clientNetwork);
+  const outboundPayload = payloadBuilder(incomingBody, clientNetwork, installAnchor);
   const rawBody = JSON.stringify(outboundPayload);
   const originHeader = typeof req.headers.origin === 'string' ? req.headers.origin : '';
   const targetUrl = `${workerUrl}${workerPath}`;
@@ -188,11 +350,15 @@ async function forwardToWorker(
     clearTimeout(timeoutId);
 
     const text = await upstream.text();
-    let json: unknown;
+    let json: Record<string, unknown>;
     try {
-      json = JSON.parse(text);
+      const parsed = JSON.parse(text);
+      json = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : { ok: false };
     } catch {
       json = { ok: false, error: 'Invalid response from verification backend.' };
+    }
+    if (upstream.ok) {
+      json.issuedInstallToken = installAnchor.canonicalToken;
     }
     res.status(upstream.status).json(json);
   } catch (err) {
@@ -224,6 +390,7 @@ async function createApp() {
     const hostOrigin = req.headers.host ? `${req.protocol}://${req.headers.host}` : '';
     if (origin && (origin === hostOrigin || allowedOrigins.has(origin))) {
       res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -241,6 +408,7 @@ async function createApp() {
   // Health endpoint for Cloud Run readiness probes
   app.get('/api/health', (_req: Request, res: Response) => {
     const { workerUrl, bridgeSecret } = getWorkerConfig();
+    res.setHeader('Cache-Control', 'no-store, private');
     res.json({
       ok: true,
       service: 'pna-rewards-miniapp',
@@ -255,10 +423,16 @@ async function createApp() {
       res.status(400).json({ ok: false, error: 'Missing Telegram initData.' });
       return;
     }
-    await forwardToWorker(req, res, '/api/internal/device-verify/session', (body, clientNetwork) => ({
-      initData: body.initData,
-      clientNetwork,
-    }));
+    await forwardToWorker(
+      req,
+      res,
+      '/api/internal/device-verify/session',
+      (body, clientNetwork, installAnchor) => ({
+        initData: body.initData,
+        clientNetwork,
+        installAnchor,
+      })
+    );
   });
 
   // 2. Submit browser/device fingerprint + signed Telegram initData + nonce
@@ -270,24 +444,56 @@ async function createApp() {
       res.status(400).json({ ok: false, error: 'Missing required verification payload.' });
       return;
     }
-    await forwardToWorker(req, res, '/api/internal/device-verify/submit', (body, clientNetwork) => ({
-      initData: body.initData,
-      challengeNonce: body.challengeNonce,
-      signals: body.signals && typeof body.signals === 'object' ? body.signals : {},
-      clientNetwork,
-    }));
+    await forwardToWorker(
+      req,
+      res,
+      '/api/internal/device-verify/submit',
+      (body, clientNetwork, installAnchor) => ({
+        initData: body.initData,
+        challengeNonce: body.challengeNonce,
+        signals: body.signals && typeof body.signals === 'object' ? body.signals : {},
+        clientNetwork,
+        installAnchor,
+      })
+    );
   });
 
-  // 3. Poll authoritative verification status from Cloudflare D1
+  // 3. Observation-only device association recording for grandfathered/admin/verified users
+  app.post('/api/verify/observe', async (req: Request, res: Response) => {
+    const initData = typeof req.body?.initData === 'string' ? req.body.initData : '';
+    if (!initData) {
+      res.status(400).json({ ok: false, error: 'Missing Telegram initData.' });
+      return;
+    }
+    await forwardToWorker(
+      req,
+      res,
+      '/api/internal/device-verify/observe',
+      (body, clientNetwork, installAnchor) => ({
+        initData: body.initData,
+        signals: body.signals && typeof body.signals === 'object' ? body.signals : {},
+        clientNetwork,
+        installAnchor,
+      })
+    );
+  });
+
+  // 4. Poll authoritative verification status from Cloudflare D1
   app.post('/api/verify/status', async (req: Request, res: Response) => {
     const initData = typeof req.body?.initData === 'string' ? req.body.initData : '';
     if (!initData) {
       res.status(400).json({ ok: false, error: 'Missing Telegram initData.' });
       return;
     }
-    await forwardToWorker(req, res, '/api/internal/device-verify/status', (body) => ({
-      initData: body.initData,
-    }));
+    await forwardToWorker(
+      req,
+      res,
+      '/api/internal/device-verify/status',
+      (body, _clientNetwork, installAnchor) => ({
+        initData: body.initData,
+        installAnchor,
+      })
+    );
   });
 
   // Serve Mini App frontend: Vite dev middleware in dev, compiled dist-miniapp in prod

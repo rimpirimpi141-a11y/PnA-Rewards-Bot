@@ -67,6 +67,7 @@ import {
 } from './handlers/withdrawal.js';
 import { adminReplyKeyboard } from './keyboards.js';
 import {
+  handleDeviceVerifyObserve,
   handleDeviceVerifySession,
   handleDeviceVerifyStatus,
   handleDeviceVerifySubmit,
@@ -565,6 +566,10 @@ export default {
 
     if (request.method === 'POST' && url.pathname === '/api/internal/device-verify/submit') {
       return handleDeviceVerifySubmit(request, env);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/internal/device-verify/observe') {
+      return handleDeviceVerifyObserve(request, env);
     }
 
     if (request.method === 'POST' && url.pathname === '/api/internal/device-verify/status') {

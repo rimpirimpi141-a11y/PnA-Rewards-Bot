@@ -82,6 +82,13 @@ export const DEFAULT_SETTINGS = {
     '🔧 <b>Scheduled Maintenance</b>\n\n𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 is currently undergoing maintenance to improve your experience.\n\n✅ Your balance, referrals, and vouchers remain 100% safe.\n⏳ Please check back shortly!',
   supportUsername: DEFAULT_SUPPORT_USERNAME,
   updateChannelUrl: DEFAULT_UPDATE_CHANNEL_URL,
+  currentVerificationGeneration: 2,
+  withdrawalCooldownMinutes: 1440, // 24 hours default
+  balanceTransfersEnabled: true,
+  referralAlertsEnabled: true,
+  referralAlertThreshold: 10,
+  referralAlertEarningsPaise: 3000,
+  referralAlertWindowHours: 24,
   lowStockThresholds: {
     amazon: 5,
     google_play: 5,

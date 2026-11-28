@@ -19,7 +19,7 @@ import {
   normalizeVoucherCode,
 } from './config.js';
 
-function assertDB(env) {
+export function assertDB(env) {
   if (!env?.DB || typeof env.DB.prepare !== 'function') {
     throw new Error(
       'Cloudflare D1 database binding "DB" is not configured. Ensure [[d1_databases]] binding = "DB" is set in wrangler.toml.'
@@ -78,6 +78,11 @@ function mapUserRow(row) {
     activePendingWithdrawalId: row.active_pending_withdrawal_id || null,
     forceJoinVerified: Boolean(row.force_join_verified),
     withdrawalCount: toNonNegInt(row.withdrawal_count),
+    lastVerifiedGeneration: toNonNegInt(row.last_verified_generation),
+    customMinWithdrawalPaise:
+      row.custom_min_withdrawal_paise !== null && row.custom_min_withdrawal_paise !== undefined
+        ? toInt(row.custom_min_withdrawal_paise)
+        : null,
     deviceVerificationStatus: row.device_verification_status
       ? String(row.device_verification_status)
       : 'grandfathered',
@@ -2771,6 +2776,75 @@ export async function findOtherUsersByFingerprint(env, fingerprintType, fingerpr
   }));
 }
 
+export async function findOtherUsersBySignal(env, signalType, signalHash, excludeUserId) {
+  if (!signalType || !signalHash) return [];
+  const db = assertDB(env);
+  try {
+    const res = await db
+      .prepare(
+        `SELECT user_id, first_seen_at, last_seen_at, seen_count
+         FROM device_signal_links
+         WHERE signal_type = ? AND signal_hash = ? AND user_id <> ?
+         ORDER BY last_seen_at DESC
+         LIMIT 25`
+      )
+      .bind(String(signalType), String(signalHash), String(excludeUserId))
+      .all();
+    return (res.results || []).map((r) => ({
+      userId: String(r.user_id),
+      firstSeenAt: toInt(r.first_seen_at),
+      lastSeenAt: toInt(r.last_seen_at),
+      seenCount: toNonNegInt(r.seen_count),
+    }));
+  } catch (err) {
+    // Graceful backward compatibility if migration 0003 has not been applied yet
+    if (String(err?.message || '').includes('no such table')) {
+      return [];
+    }
+    throw err;
+  }
+}
+
+export async function getUserDeviceSignalSummary(env, userId) {
+  const db = assertDB(env);
+  const summary = {
+    installTokens: new Set(),
+    strictFps: new Set(),
+    renderCores: new Set(),
+    hardwareCores: new Set(),
+    biometricIds: new Set(),
+    accountStorageIds: new Set(),
+  };
+  try {
+    const res = await db
+      .prepare(
+        `SELECT signal_type, signal_hash
+         FROM device_signal_links
+         WHERE user_id = ?
+         ORDER BY last_seen_at DESC
+         LIMIT 100`
+      )
+      .bind(String(userId))
+      .all();
+    for (const r of res.results || []) {
+      const t = String(r.signal_type || '');
+      const h = String(r.signal_hash || '');
+      if (!h) continue;
+      if (t === 'install_token') summary.installTokens.add(h);
+      else if (t === 'strict_fp') summary.strictFps.add(h);
+      else if (t === 'render_core') summary.renderCores.add(h);
+      else if (t === 'hardware_core') summary.hardwareCores.add(h);
+      else if (t === 'tg_biometric_id') summary.biometricIds.add(h);
+      else if (t === 'account_storage_id') summary.accountStorageIds.add(h);
+    }
+  } catch (err) {
+    if (!String(err?.message || '').includes('no such table')) {
+      throw err;
+    }
+  }
+  return summary;
+}
+
 export async function findOtherUsersByIpSubnet(env, ipSubnetHash, excludeUserId, sinceMs) {
   if (!ipSubnetHash) return [];
   const db = assertDB(env);
@@ -2828,9 +2902,128 @@ export async function getReferralReviewById(env, reviewId) {
 }
 
 /**
- * Atomically persist a device verification attempt, update fingerprint cluster mappings,
- * update the user's verification status, enqueue a suspicious referral review if applicable,
- * and append an immutable verification audit log entry.
+ * Observation-only atomic persistence for grandfathered, verified, and admin accounts.
+ * Records cross-account device associations into `device_signal_links`,
+ * `device_fingerprint_accounts`, and `verification_audit_logs` WITHOUT EVER
+ * changing `users.device_verification_status`, balances, referrals, or access.
+ */
+export async function recordDeviceObservationAtomic(
+  env,
+  {
+    userId,
+    strictFpHash = '',
+    fuzzyFpHash = '',
+    signalLinks = [],
+    ipHash = '',
+    countryCode = '',
+    observedStatus = 'grandfathered',
+    details = {},
+    now = Date.now(),
+  }
+) {
+  const db = assertDB(env);
+  const uid = String(userId);
+  const auditId = generateId('VAUD');
+  const statements = [];
+
+  if (strictFpHash) {
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO device_fingerprint_accounts (
+            fingerprint_type, fingerprint_hash, user_id, first_seen_at, last_seen_at, seen_count
+          ) VALUES ('strict', ?, ?, ?, ?, 1)
+          ON CONFLICT(fingerprint_type, fingerprint_hash, user_id) DO UPDATE SET
+            last_seen_at = excluded.last_seen_at,
+            seen_count = device_fingerprint_accounts.seen_count + 1`
+        )
+        .bind(String(strictFpHash), uid, now, now)
+    );
+  }
+
+  if (fuzzyFpHash) {
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO device_fingerprint_accounts (
+            fingerprint_type, fingerprint_hash, user_id, first_seen_at, last_seen_at, seen_count
+          ) VALUES ('fuzzy', ?, ?, ?, ?, 1)
+          ON CONFLICT(fingerprint_type, fingerprint_hash, user_id) DO UPDATE SET
+            last_seen_at = excluded.last_seen_at,
+            seen_count = device_fingerprint_accounts.seen_count + 1`
+        )
+        .bind(String(fuzzyFpHash), uid, now, now)
+    );
+  }
+
+  const dedupedLinks = [];
+  const seenKey = new Set();
+  for (const item of signalLinks || []) {
+    if (!item?.signalType || !item?.signalHash) continue;
+    const k = `${item.signalType}:${item.signalHash}`;
+    if (seenKey.has(k)) continue;
+    seenKey.add(k);
+    dedupedLinks.push(item);
+  }
+
+  for (const item of dedupedLinks) {
+    statements.push(
+      db
+        .prepare(
+          `INSERT INTO device_signal_links (
+            signal_type, signal_hash, user_id, first_seen_at, last_seen_at, seen_count
+          ) VALUES (?, ?, ?, ?, ?, 1)
+          ON CONFLICT(signal_type, signal_hash, user_id) DO UPDATE SET
+            last_seen_at = excluded.last_seen_at,
+            seen_count = device_signal_links.seen_count + 1`
+        )
+        .bind(String(item.signalType), String(item.signalHash), uid, now, now)
+    );
+  }
+
+  statements.push(
+    db
+      .prepare(
+        `INSERT INTO verification_audit_logs (
+          id, event_type, user_id, actor_id, verification_id, review_id,
+          verdict, risk_score, details_json, created_at
+        ) VALUES (?, 'DEVICE_OBSERVED', ?, 'system', NULL, NULL, ?, 0, ?, ?)`
+      )
+      .bind(
+        auditId,
+        uid,
+        String(observedStatus || 'grandfathered'),
+        JSON.stringify({
+          observeOnly: true,
+          signalTypes: dedupedLinks.map((x) => x.signalType),
+          hasIpHash: Boolean(ipHash),
+          countryCode: String(countryCode || ''),
+          ...(details || {}),
+        }),
+        now
+      )
+  );
+
+  try {
+    await db.batch(statements);
+    return { ok: true, auditId, recordedSignals: dedupedLinks.length };
+  } catch (err) {
+    // Fallback if migration 0003 table does not exist yet: still write legacy tables + audit
+    if (String(err?.message || '').includes('no such table') && dedupedLinks.length > 0) {
+      const fallbackStmts = statements.filter(
+        (_, idx) => idx < (strictFpHash ? 1 : 0) + (fuzzyFpHash ? 1 : 0) || idx === statements.length - 1
+      );
+      await db.batch(fallbackStmts);
+      return { ok: true, auditId, recordedSignals: 0, legacyFallback: true };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Atomically persist a device verification attempt, update fingerprint & multi-signal
+ * cluster mappings, update the user's verification status, enqueue a suspicious referral
+ * review if applicable, and append an immutable verification audit log entry.
  */
 export async function recordDeviceVerificationAtomic(
   env,
@@ -2841,6 +3034,7 @@ export async function recordDeviceVerificationAtomic(
     initDataHash,
     strictFpHash,
     fuzzyFpHash,
+    signalLinks = [],
     signalHashes = {},
     ipHash = '',
     ipSubnetHash = '',
@@ -2852,9 +3046,12 @@ export async function recordDeviceVerificationAtomic(
     riskScore = 0,
     riskReasons = [],
     verdict,
+    referralDecision = 'no_referrer',
+    holdReferralReview = false,
     verifiedTokenJti = null,
     pendingReferrerId = null,
     matchedUserIds = [],
+    matchedSignalTypes = [],
     now = Date.now(),
   }
 ) {
@@ -2863,12 +3060,22 @@ export async function recordDeviceVerificationAtomic(
   const safeScore = Math.max(0, Math.min(100, toInt(riskScore, 0)));
   const verifiedAt = verdict === 'verified' ? now : null;
   const auditId = generateId('VAUD');
-  const reviewId =
-    pendingReferrerId && (verdict === 'pending_review' || verdict === 'rejected')
-      ? generateId('RREV')
-      : null;
+  const shouldCreateReview =
+    Boolean(pendingReferrerId) &&
+    (Boolean(holdReferralReview) || verdict === 'pending_review' || verdict === 'rejected');
+  const reviewId = shouldCreateReview ? generateId('RREV') : null;
 
-  const statements = [
+  const dedupedLinks = [];
+  const seenKey = new Set();
+  for (const item of signalLinks || []) {
+    if (!item?.signalType || !item?.signalHash) continue;
+    const k = `${item.signalType}:${item.signalHash}`;
+    if (seenKey.has(k)) continue;
+    seenKey.add(k);
+    dedupedLinks.push(item);
+  }
+
+  const baseStatements = [
     db
       .prepare(
         `INSERT INTO device_verifications (
@@ -2936,8 +3143,23 @@ export async function recordDeviceVerificationAtomic(
       .bind(String(verdict), verifiedAt, verifiedAt, safeScore, String(strictFpHash), uid),
   ];
 
-  if (verdict === 'verified') {
-    statements.push(
+  const signalStatements = dedupedLinks.map((item) =>
+    db
+      .prepare(
+        `INSERT INTO device_signal_links (
+          signal_type, signal_hash, user_id, first_seen_at, last_seen_at, seen_count
+        ) VALUES (?, ?, ?, ?, ?, 1)
+        ON CONFLICT(signal_type, signal_hash, user_id) DO UPDATE SET
+          last_seen_at = excluded.last_seen_at,
+          seen_count = device_signal_links.seen_count + 1`
+      )
+      .bind(String(item.signalType), String(item.signalHash), uid, now, now)
+  );
+
+  const tailStatements = [];
+
+  if (verdict === 'verified' && !shouldCreateReview) {
+    tailStatements.push(
       db
         .prepare(
           `UPDATE referral_reviews
@@ -2953,7 +3175,7 @@ export async function recordDeviceVerificationAtomic(
   }
 
   if (reviewId && pendingReferrerId) {
-    statements.push(
+    tailStatements.push(
       db
         .prepare(
           `INSERT INTO referral_reviews (
@@ -2985,7 +3207,7 @@ export async function recordDeviceVerificationAtomic(
     );
   }
 
-  statements.push(
+  tailStatements.push(
     db
       .prepare(
         `INSERT INTO verification_audit_logs (
@@ -3003,7 +3225,9 @@ export async function recordDeviceVerificationAtomic(
         safeScore,
         JSON.stringify({
           reasons: riskReasons || [],
+          referralDecision: String(referralDecision || 'no_referrer'),
           matchedUserCount: Array.isArray(matchedUserIds) ? matchedUserIds.length : 0,
+          matchedSignalTypes: Array.isArray(matchedSignalTypes) ? matchedSignalTypes : [],
           countryCode: String(countryCode || ''),
           proxyVpnFlag: Boolean(proxyVpnFlag),
           datacenterFlag: Boolean(datacenterFlag),
@@ -3013,12 +3237,16 @@ export async function recordDeviceVerificationAtomic(
   );
 
   try {
-    await db.batch(statements);
+    await db.batch([...baseStatements, ...signalStatements, ...tailStatements]);
     return { ok: true, verificationId, reviewId, auditId };
   } catch (err) {
     const msg = String(err?.message || '');
     if (msg.includes('UNIQUE') && msg.includes('init_data_hash')) {
       return { ok: false, replay: true, error: 'Duplicate or replayed Telegram verification payload.' };
+    }
+    if (msg.includes('no such table') && signalStatements.length > 0) {
+      await db.batch([...baseStatements, ...tailStatements]);
+      return { ok: true, verificationId, reviewId, auditId, legacyFallback: true };
     }
     throw err;
   }
@@ -3252,7 +3480,7 @@ export async function resolveReferralReviewAtomic(
 
 export async function getDeviceVerificationStats(env) {
   const db = assertDB(env);
-  const [userCounts, reviewCounts, clusterRow, attemptsRow] = await Promise.all([
+  const [userCounts, reviewCounts, attemptsRow] = await Promise.all([
     db
       .prepare(
         `SELECT
@@ -3273,19 +3501,47 @@ export async function getDeviceVerificationStats(env) {
          FROM referral_reviews`
       )
       .first(),
-    db
+    db.prepare('SELECT COUNT(*) AS attempts_cnt FROM device_verifications').first(),
+  ]);
+
+  let duplicateClusters = 0;
+  try {
+    const clusterRow = await db
       .prepare(
         `SELECT COUNT(*) AS cluster_cnt FROM (
-          SELECT fingerprint_hash
+          SELECT signal_type, signal_hash
+          FROM device_signal_links
+          WHERE signal_type IN ('install_token', 'strict_fp', 'render_core', 'tg_biometric_id')
+          GROUP BY signal_type, signal_hash
+          HAVING COUNT(DISTINCT user_id) > 1
+          UNION
+          SELECT 'strict_fp' AS signal_type, fingerprint_hash AS signal_hash
           FROM device_fingerprint_accounts
           WHERE fingerprint_type = 'strict'
           GROUP BY fingerprint_hash
           HAVING COUNT(DISTINCT user_id) > 1
         )`
       )
-      .first(),
-    db.prepare('SELECT COUNT(*) AS attempts_cnt FROM device_verifications').first(),
-  ]);
+      .first();
+    duplicateClusters = toNonNegInt(clusterRow?.cluster_cnt);
+  } catch (err) {
+    if (String(err?.message || '').includes('no such table')) {
+      const legacyRow = await db
+        .prepare(
+          `SELECT COUNT(*) AS cluster_cnt FROM (
+            SELECT fingerprint_hash
+            FROM device_fingerprint_accounts
+            WHERE fingerprint_type = 'strict'
+            GROUP BY fingerprint_hash
+            HAVING COUNT(DISTINCT user_id) > 1
+          )`
+        )
+        .first();
+      duplicateClusters = toNonNegInt(legacyRow?.cluster_cnt);
+    } else {
+      throw err;
+    }
+  }
 
   return {
     verifiedUsers: toNonNegInt(userCounts?.verified_cnt),
@@ -3296,7 +3552,7 @@ export async function getDeviceVerificationStats(env) {
     pendingReferralReviews: toNonNegInt(reviewCounts?.pending_cnt),
     approvedReferralReviews: toNonNegInt(reviewCounts?.approved_cnt),
     rejectedReferralReviews: toNonNegInt(reviewCounts?.rejected_cnt),
-    duplicateDeviceClusters: toNonNegInt(clusterRow?.cluster_cnt),
+    duplicateDeviceClusters: duplicateClusters,
     totalAttempts: toNonNegInt(attemptsRow?.attempts_cnt),
   };
 }
@@ -3331,56 +3587,145 @@ export async function getPendingReferralReviewsPage(env, page = 1, pageSize = 5)
 
 export async function getSuspiciousDeviceClustersPage(env, page = 1, pageSize = 5) {
   const db = assertDB(env);
-  const countRow = await db
-    .prepare(
-      `SELECT COUNT(*) AS cnt FROM (
-        SELECT fingerprint_hash
-        FROM device_fingerprint_accounts
-        WHERE fingerprint_type = 'strict'
-        GROUP BY fingerprint_hash
-        HAVING COUNT(DISTINCT user_id) > 1
-      )`
-    )
-    .first();
-  const total = toNonNegInt(countRow?.cnt);
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const safePage = Math.max(1, Math.min(toInt(page, 1), totalPages));
-  const offset = (safePage - 1) * pageSize;
 
-  const res = await db
-    .prepare(
-      `SELECT
-        dfa.fingerprint_hash,
-        COUNT(DISTINCT dfa.user_id) AS account_count,
-        GROUP_CONCAT(dfa.user_id, ',') AS user_ids,
-        MAX(dfa.last_seen_at) AS last_seen_at,
-        MAX(COALESCE(u.device_risk_score, 0)) AS max_risk_score
-       FROM device_fingerprint_accounts dfa
-       LEFT JOIN users u ON u.telegram_id = dfa.user_id
-       WHERE dfa.fingerprint_type = 'strict'
-       GROUP BY dfa.fingerprint_hash
-       HAVING COUNT(DISTINCT dfa.user_id) > 1
-       ORDER BY account_count DESC, last_seen_at DESC
-       LIMIT ? OFFSET ?`
-    )
-    .bind(pageSize, offset)
-    .all();
+  try {
+    const countRow = await db
+      .prepare(
+        `SELECT COUNT(*) AS cnt FROM (
+          SELECT signal_type, signal_hash
+          FROM device_signal_links
+          WHERE signal_type IN ('install_token', 'strict_fp', 'render_core', 'tg_biometric_id')
+          GROUP BY signal_type, signal_hash
+          HAVING COUNT(DISTINCT user_id) > 1
+          UNION
+          SELECT 'strict_fp' AS signal_type, fingerprint_hash AS signal_hash
+          FROM device_fingerprint_accounts
+          WHERE fingerprint_type = 'strict'
+          GROUP BY fingerprint_hash
+          HAVING COUNT(DISTINCT user_id) > 1
+        )`
+      )
+      .first();
 
-  return {
-    total,
-    totalPages,
-    page: safePage,
-    items: (res.results || []).map((row) => ({
-      fingerprintHash: String(row.fingerprint_hash),
-      accountCount: toNonNegInt(row.account_count),
-      userIds: String(row.user_ids || '')
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-      lastSeenAt: toInt(row.last_seen_at),
-      maxRiskScore: toNonNegInt(row.max_risk_score),
-    })),
-  };
+    const total = toNonNegInt(countRow?.cnt);
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const safePage = Math.max(1, Math.min(toInt(page, 1), totalPages));
+    const offset = (safePage - 1) * pageSize;
+
+    const res = await db
+      .prepare(
+        `WITH combined_links AS (
+          SELECT signal_type, signal_hash, user_id, last_seen_at
+          FROM device_signal_links
+          WHERE signal_type IN ('install_token', 'strict_fp', 'render_core', 'tg_biometric_id')
+          UNION
+          SELECT 'strict_fp' AS signal_type, fingerprint_hash AS signal_hash, user_id, last_seen_at
+          FROM device_fingerprint_accounts
+          WHERE fingerprint_type = 'strict'
+        )
+        SELECT
+          cl.signal_type,
+          cl.signal_hash AS fingerprint_hash,
+          COUNT(DISTINCT cl.user_id) AS account_count,
+          GROUP_CONCAT(DISTINCT cl.user_id) AS user_ids,
+          MAX(cl.last_seen_at) AS last_seen_at,
+          MAX(COALESCE(u.device_risk_score, 0)) AS max_risk_score,
+          SUM(CASE WHEN u.referred_by IS NOT NULL OR u.pending_referrer_id IS NOT NULL THEN 1 ELSE 0 END) AS referred_member_cnt
+        FROM combined_links cl
+        LEFT JOIN users u ON u.telegram_id = cl.user_id
+        GROUP BY cl.signal_type, cl.signal_hash
+        HAVING COUNT(DISTINCT cl.user_id) > 1
+        ORDER BY
+          CASE cl.signal_type
+            WHEN 'install_token' THEN 1
+            WHEN 'strict_fp' THEN 2
+            WHEN 'render_core' THEN 3
+            ELSE 4
+          END ASC,
+          account_count DESC,
+          last_seen_at DESC
+        LIMIT ? OFFSET ?`
+      )
+      .bind(pageSize, offset)
+      .all();
+
+    return {
+      total,
+      totalPages,
+      page: safePage,
+      items: (res.results || []).map((row) => ({
+        signalType: String(row.signal_type || 'strict_fp'),
+        fingerprintHash: String(row.fingerprint_hash),
+        accountCount: toNonNegInt(row.account_count),
+        userIds: String(row.user_ids || '')
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean),
+        lastSeenAt: toInt(row.last_seen_at),
+        maxRiskScore: toNonNegInt(row.max_risk_score),
+        hasReferralLink: toNonNegInt(row.referred_member_cnt) > 0,
+      })),
+    };
+  } catch (err) {
+    if (!String(err?.message || '').includes('no such table')) {
+      throw err;
+    }
+
+    // Backward-compatible fallback if migration 0003 has not been applied yet
+    const countRow = await db
+      .prepare(
+        `SELECT COUNT(*) AS cnt FROM (
+          SELECT fingerprint_hash
+          FROM device_fingerprint_accounts
+          WHERE fingerprint_type = 'strict'
+          GROUP BY fingerprint_hash
+          HAVING COUNT(DISTINCT user_id) > 1
+        )`
+      )
+      .first();
+    const total = toNonNegInt(countRow?.cnt);
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const safePage = Math.max(1, Math.min(toInt(page, 1), totalPages));
+    const offset = (safePage - 1) * pageSize;
+
+    const res = await db
+      .prepare(
+        `SELECT
+          dfa.fingerprint_hash,
+          COUNT(DISTINCT dfa.user_id) AS account_count,
+          GROUP_CONCAT(dfa.user_id, ',') AS user_ids,
+          MAX(dfa.last_seen_at) AS last_seen_at,
+          MAX(COALESCE(u.device_risk_score, 0)) AS max_risk_score,
+          SUM(CASE WHEN u.referred_by IS NOT NULL OR u.pending_referrer_id IS NOT NULL THEN 1 ELSE 0 END) AS referred_member_cnt
+         FROM device_fingerprint_accounts dfa
+         LEFT JOIN users u ON u.telegram_id = dfa.user_id
+         WHERE dfa.fingerprint_type = 'strict'
+         GROUP BY dfa.fingerprint_hash
+         HAVING COUNT(DISTINCT dfa.user_id) > 1
+         ORDER BY account_count DESC, last_seen_at DESC
+         LIMIT ? OFFSET ?`
+      )
+      .bind(pageSize, offset)
+      .all();
+
+    return {
+      total,
+      totalPages,
+      page: safePage,
+      items: (res.results || []).map((row) => ({
+        signalType: 'strict_fp',
+        fingerprintHash: String(row.fingerprint_hash),
+        accountCount: toNonNegInt(row.account_count),
+        userIds: String(row.user_ids || '')
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean),
+        lastSeenAt: toInt(row.last_seen_at),
+        maxRiskScore: toNonNegInt(row.max_risk_score),
+        hasReferralLink: toNonNegInt(row.referred_member_cnt) > 0,
+      })),
+    };
+  }
 }
 
 

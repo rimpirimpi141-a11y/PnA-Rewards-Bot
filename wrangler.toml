@@ -43,5 +43,5 @@ WEBHOOK_PATH = "/webhook"
 BOT_USERNAME = ""
 # Telegram Mini App (Google Cloud Run) Device Verification settings
 DEVICE_VERIFICATION_ENABLED = "true"
-MINIAPP_URL = "https://ais-pre-5anw25hqtptdicmzho3ex7-704214232389.asia-east1.run.app"
-MINIAPP_ALLOWED_ORIGINS = "https://ais-pre-5anw25hqtptdicmzho3ex7-704214232389.asia-east1.run.app,https://ais-dev-5anw25hqtptdicmzho3ex7-704214232389.asia-east1.run.app"
+MINIAPP_URL = "https://p-a-rewards.ai.studio"
+MINIAPP_ALLOWED_ORIGINS = "https://p-a-rewards.ai.studio,https://ais-pre-5anw25hqtptdicmzho3ex7-704214232389.asia-east1.run.app,https://ais-dev-5anw25hqtptdicmzho3ex7-704214232389.asia-east1.run.app"

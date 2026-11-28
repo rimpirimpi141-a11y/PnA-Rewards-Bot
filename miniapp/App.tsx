@@ -17,10 +17,15 @@ import { motion } from 'motion/react';
 import { useCallback, useEffect, useState } from 'react';
 import {
   fetchVerificationStatus,
+  observeVerifiedDevice,
   requestVerificationSession,
   submitDeviceVerification,
 } from './lib/api';
-import { collectDeviceFingerprint } from './lib/fingerprint';
+import {
+  collectDeviceFingerprint,
+  persistInstallToken,
+  readStoredInstallToken,
+} from './lib/fingerprint';
 import {
   closeTelegramMiniApp,
   initTelegramMiniApp,
@@ -56,14 +61,14 @@ const INITIAL_STEPS: StepItem[] = [
   },
   {
     id: 'device',
-    label: 'Browser & Device Signals',
-    detail: 'Creates salted probabilistic fingerprint hash',
+    label: 'Device & WebView Signals',
+    detail: 'Collects stable system & installation hashes',
     status: 'idle',
   },
   {
     id: 'unlock',
     label: 'Anti-Abuse Check & Unlock',
-    detail: 'Saves record in D1 and unlocks bot menu',
+    detail: 'Evaluates cross-account reputation in D1',
     status: 'idle',
   },
 ];
@@ -83,6 +88,31 @@ export default function App() {
     setSteps((prev) => prev.map((item) => (item.id === id ? { ...item, status } : item)));
   }, []);
 
+  /**
+   * Observation-only background telemetry for already-verified, grandfathered,
+   * and admin accounts. NEVER changes their status or blocks access; ensures
+   * their device installation & signals are indexed so multi-account abuse on
+   * the same phone is detected on secondary accounts.
+   */
+  const runSilentObservation = useCallback(async (rawInitData: string, platform: string) => {
+    try {
+      const [signals, storedToken] = await Promise.all([
+        collectDeviceFingerprint(platform),
+        readStoredInstallToken(),
+      ]);
+      const obsRes = await observeVerifiedDevice({
+        initData: rawInitData,
+        signals,
+        storageInstallToken: storedToken,
+      });
+      if (obsRes.issuedInstallToken) {
+        await persistInstallToken(obsRes.issuedInstallToken);
+      }
+    } catch {
+      // Never disrupt UX for grandfathered/admin/verified users
+    }
+  }, []);
+
   const bootstrap = useCallback(async () => {
     const tg = initTelegramMiniApp();
     setTgPlatform(tg.platform);
@@ -95,13 +125,19 @@ export default function App() {
 
     setInitData(tg.initData);
 
-    // Check existing authoritative status first
-    const statusRes = await fetchVerificationStatus(tg.initData);
+    const storedToken = await readStoredInstallToken();
+    const statusRes = await fetchVerificationStatus(tg.initData, storedToken);
+    if (statusRes.issuedInstallToken) {
+      await persistInstallToken(statusRes.issuedInstallToken);
+    }
+
     if (statusRes.ok && (statusRes.status === 'verified' || statusRes.status === 'grandfathered')) {
       setSteps(INITIAL_STEPS.map((s) => ({ ...s, status: 'done' })));
       setHeadlineMessage('Your device is verified and your 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 menu is unlocked.');
       setReferenceId(statusRes.latestVerificationId || '');
       setScreen('verified');
+      // Record observation-only device association in background (never blocks)
+      void runSilentObservation(tg.initData, tg.platform);
       return;
     }
 
@@ -125,7 +161,7 @@ export default function App() {
 
     setSteps(INITIAL_STEPS);
     setScreen('ready');
-  }, []);
+  }, [runSilentObservation]);
 
   useEffect(() => {
     void bootstrap();
@@ -148,8 +184,14 @@ export default function App() {
     ]);
 
     try {
+      const storedToken = await readStoredInstallToken();
+
       // Step 1: Validate Telegram initData & obtain single-use server challenge nonce
-      const sessionRes = await requestVerificationSession(initData);
+      const sessionRes = await requestVerificationSession(initData, storedToken);
+      if (sessionRes.issuedInstallToken) {
+        await persistInstallToken(sessionRes.issuedInstallToken);
+      }
+
       if (!sessionRes.ok) {
         updateStep('telegram', 'warn');
         triggerHaptic('error');
@@ -164,6 +206,8 @@ export default function App() {
         triggerHaptic('success');
         setHeadlineMessage('Your device is already verified. Return to the bot to continue.');
         setScreen('verified');
+        // Record observation-only device association for admins/grandfathered users
+        void runSilentObservation(initData, tgPlatform);
         return;
       }
 
@@ -178,8 +222,11 @@ export default function App() {
       updateStep('telegram', 'done');
       updateStep('device', 'active');
 
-      // Step 2: Collect privacy-conscious probabilistic browser/WebView fingerprint
-      const signals = await collectDeviceFingerprint(tgPlatform);
+      // Step 2: Collect stabilized device/WebView signals + latest signed installation token
+      const [signals, latestToken] = await Promise.all([
+        collectDeviceFingerprint(tgPlatform),
+        readStoredInstallToken(),
+      ]);
 
       updateStep('device', 'done');
       updateStep('unlock', 'active');
@@ -189,7 +236,12 @@ export default function App() {
         initData,
         challengeNonce: sessionRes.challengeNonce,
         signals,
+        storageInstallToken: latestToken || sessionRes.issuedInstallToken || storedToken,
       });
+
+      if (submitRes.issuedInstallToken) {
+        await persistInstallToken(submitRes.issuedInstallToken);
+      }
 
       if (!submitRes.ok) {
         updateStep('unlock', 'warn');
@@ -234,14 +286,18 @@ export default function App() {
       setHeadlineMessage('Network error during verification. Check your connection and retry.');
       setScreen('error');
     }
-  }, [initData, tgPlatform, updateStep]);
+  }, [initData, runSilentObservation, tgPlatform, updateStep]);
 
   const refreshStatus = useCallback(async () => {
     if (!initData) return;
     setCheckingStatus(true);
     triggerHaptic('light');
     try {
-      const res = await fetchVerificationStatus(initData);
+      const storedToken = await readStoredInstallToken();
+      const res = await fetchVerificationStatus(initData, storedToken);
+      if (res.issuedInstallToken) {
+        await persistInstallToken(res.issuedInstallToken);
+      }
       if (res.ok && (res.status === 'verified' || res.status === 'grandfathered')) {
         triggerHaptic('success');
         setSteps(INITIAL_STEPS.map((s) => ({ ...s, status: 'done' })));
@@ -414,10 +470,9 @@ export default function App() {
               <Info className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
               <p className="text-xs leading-relaxed" style={{ color: 'var(--pna-muted)' }}>
                 <strong style={{ color: 'var(--pna-text)' }}>Privacy &amp; Fairness Notice:</strong>{' '}
-                We evaluate probabilistic browser/WebView characteristics (screen, rendering,
-                timezone, and hardware hints) stored as salted hashes. We do not access hardware
-                IMEI, Android ID, or private files, and shared Wi-Fi/IP alone never rejects your
-                account.
+                We evaluate standard browser/WebView characteristics and a server-signed origin
+                token stored as salted hashes. We do not access hardware IMEI, Android ID, or
+                private files, and shared Wi-Fi/IP alone never rejects your account.
               </p>
             </div>
           </motion.section>

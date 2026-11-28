@@ -1,23 +1,35 @@
 // ============================================================================
-// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Telegram Mini App Device Verification & Anti-Abuse Engine
+// 𝐏ⁿ𝐀 𝐑𝐄𝐖𝐀𝐑𝐃𝐒 — Telegram Mini App Device Verification & Cross-Account Reputation Engine
 // ============================================================================
 // Runs exclusively on Cloudflare Workers with direct access to `env.DB` (D1)
 // and `env.BOT_TOKEN`.
 //
-// Security Properties:
+// Security & Anti-Abuse Architecture:
 //  1. Cloud Run -> Cloudflare Worker calls authenticated via HMAC-SHA256
 //     (`X-PnA-Timestamp`, `X-PnA-Nonce`, `X-PnA-Signature`) with constant-time
 //     verification and ±60s skew window.
 //  2. Telegram WebApp `initData` cryptographically validated via Web Crypto
 //     HMAC-SHA256("WebAppData", BOT_TOKEN) per Telegram Mini Apps specification.
-//  3. Freshness (`auth_date` <= 5 min) + single-use challenge nonce + UNIQUE
-//     `init_data_hash` replay protection.
-//  4. Probabilistic browser/WebView fingerprint hashing (strict + fuzzy).
-//     NEVER claims hardware IMEI or Android ID access.
-//  5. Balanced risk scoring: shared IP alone contributes +15 (NEVER auto-rejects
-//     families, hostels, or shared Wi-Fi). Duplicate device fingerprints flag
-//     `pending_review` for manual admin inspection.
-//  6. Issues short-lived HMAC-signed verification token (`pna_v1.<payload>.<sig>`).
+//  3. Server-signed WebView installation token (`pna_inst_v1.<id>.<hmac>`)
+//     independently verified on BOTH Cloud Run and Cloudflare Worker.
+//     Unsigned or client-generated tokens are strictly rejected.
+//  4. Multi-component cross-account device matching across OTHER user IDs:
+//     - install_token (strongest same-installation signal)
+//     - strict_fp (deterministic system-font Canvas + WebGL + Audio + model)
+//     - render_core (Canvas + WebGL + screen/DPR — immune to Audio timeout)
+//     - hardware_core (GPU + screen + hardware + model + timezone)
+//     - tg_biometric_id (optional Bot API 7.2+ BiometricManager.deviceId;
+//       never mandatory, never forces biometric auth or permission)
+//     - account_storage_id (optional Bot API 9.0+ DeviceStorage continuity;
+//       strictly per-user same-account continuity tracking only)
+//  5. Observation-only device association recording (`/observe`) for
+//     grandfathered, verified, and admin accounts WITHOUT changing their
+//     verification status or blocking access.
+//  6. Clean separation of device identity signals vs secondary network/IP
+//     signals (RFC 4291 IPv6 /48 expansion; never reads Cloud Run proxy ASN;
+//     shared Wi-Fi alone NEVER causes rejection).
+//  7. Clean separation of account access verdict vs referral reward approval
+//     with high-priority same-device self-referral flagging.
 // ============================================================================
 
 import { DIVIDER } from '../animations.js';
@@ -38,12 +50,15 @@ import {
   createVerificationChallenge,
   findOtherUsersByFingerprint,
   findOtherUsersByIpSubnet,
+  findOtherUsersBySignal,
   getDeviceVerificationByInitDataHash,
   getLatestUserDeviceVerification,
   getSettings,
   getUser,
+  getUserDeviceSignalSummary,
   getUserReferralReview,
   isAdmin,
+  recordDeviceObservationAtomic,
   recordDeviceVerificationAtomic,
   updateUserForceJoinVerified,
 } from '../database.js';
@@ -56,7 +71,7 @@ import { logSuspiciousDeviceEvent } from './secretary.js';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-// Known hosting / VPN / cloud provider ASN keywords (heuristic partial signal only)
+// Known hosting / VPN / cloud provider ASN keywords (only applied when genuine client ASN is supplied)
 const DATACENTER_ASN_KEYWORDS = [
   'amazon',
   'aws',
@@ -183,12 +198,51 @@ async function getVerificationSigningKey(env) {
   return hmacSha256Bytes(bridge, 'pna-rewards:verification-token-key:v1');
 }
 
+async function getInstallTokenSigningKey(env) {
+  const bridge = getBridgeSecret(env);
+  if (!bridge) return null;
+  return hmacSha256Bytes(bridge, 'pna-rewards:install-token-key:v1');
+}
+
 async function getFingerprintSalt(env) {
   const bridge = getBridgeSecret(env);
   if (bridge) {
     return hmacSha256Hex(bridge, 'pna-rewards:fingerprint-salt:v1');
   }
   return sha256Hex('pna-rewards:local-dev-salt');
+}
+
+/**
+ * Independently verify a server-signed WebView installation token (`pna_inst_v1.<id>.<hmac>`).
+ * Uses the exact same derived HMAC key as `server.ts`. Never trusts unsigned/forged strings.
+ */
+export async function verifySignedInstallToken(rawToken, env) {
+  const clean = typeof rawToken === 'string' ? rawToken.trim() : '';
+  if (!clean) return { valid: false, tokenId: '' };
+  const match = clean.match(/^pna_inst_v1\.([a-f0-9]{24,64})\.([a-f0-9]{64})$/i);
+  if (!match) return { valid: false, tokenId: '' };
+  const key = await getInstallTokenSigningKey(env);
+  if (!key) return { valid: false, tokenId: '' };
+
+  const tokenId = match[1].toLowerCase();
+  const providedSig = hexToBytes(match[2].toLowerCase());
+  if (!providedSig || providedSig.length !== 32) return { valid: false, tokenId: '' };
+
+  const expectedSig = await hmacSha256Bytes(key, `pna_inst_v1.${tokenId}`);
+  if (!timingSafeEqualBytes(expectedSig, providedSig)) {
+    return { valid: false, tokenId: '' };
+  }
+  return { valid: true, tokenId };
+}
+
+export async function mintSignedInstallTokenWorker(env) {
+  const key = await getInstallTokenSigningKey(env);
+  if (!key) return '';
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  const tokenId = bytesToHex(bytes);
+  const sigHex = bytesToHex(await hmacSha256Bytes(key, `pna_inst_v1.${tokenId}`));
+  return `pna_inst_v1.${tokenId}.${sigHex}`;
 }
 
 // ----------------------------------------------------------------------------
@@ -225,7 +279,6 @@ export async function verifyBridgeSignature(request, rawBody, env) {
     return { ok: false, status: 401, error: 'Invalid bridge signature.' };
   }
 
-  // Optional Origin allowlist check when forwarded by Cloud Run
   const forwardedOrigin = request.headers.get('X-PnA-Origin') || '';
   const allowedOrigins = getMiniAppAllowedOrigins(env);
   if (forwardedOrigin && allowedOrigins.length > 0 && !allowedOrigins.includes(forwardedOrigin)) {
@@ -239,12 +292,6 @@ export async function verifyBridgeSignature(request, rawBody, env) {
 // 2. Cryptographic Telegram WebApp `initData` Validation
 // ----------------------------------------------------------------------------
 
-/**
- * Validate Telegram Mini App `initData` strictly according to Telegram's official
- * WebApp HMAC-SHA256 specification:
- *   secret_key = HMAC_SHA256("WebAppData", BOT_TOKEN)
- *   expected_hash = HMAC_SHA256(data_check_string, secret_key)
- */
 export async function verifyTelegramInitData(
   initDataRaw,
   botToken,
@@ -380,7 +427,7 @@ export async function verifyVerificationToken(env, token) {
 }
 
 // ----------------------------------------------------------------------------
-// 4. Privacy-Conscious Fingerprint Normalization & IP Subnet Extraction
+// 4. Privacy-Conscious Fingerprint Normalization & RFC 4291 IPv6 Subnet Extraction
 // ----------------------------------------------------------------------------
 
 function sanitizeStr(val, maxLen = 128) {
@@ -394,19 +441,75 @@ function sanitizeNum(val, min = 0, max = 100000) {
   return Math.max(min, Math.min(max, Math.round(n * 100) / 100));
 }
 
+/**
+ * Expand compressed IPv6 notation (including IPv4-mapped `::ffff:a.b.c.d`)
+ * into canonical 8-hextet lowercase form before deriving a `/48` prefix.
+ */
+function expandIpv6(rawIp) {
+  let ip = String(rawIp || '').trim().toLowerCase();
+  const zoneIdx = ip.indexOf('%');
+  if (zoneIdx !== -1) ip = ip.slice(0, zoneIdx);
+  if (!ip.includes(':')) return null;
+
+  // Handle IPv4-mapped tail (e.g. ::ffff:192.0.2.128)
+  const lastColon = ip.lastIndexOf(':');
+  const tail = ip.slice(lastColon + 1);
+  if (tail.includes('.')) {
+    const octets = tail.split('.').map((x) => Number(x));
+    if (octets.length !== 4 || octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) {
+      return null;
+    }
+    const h1 = ((octets[0] << 8) | octets[1]).toString(16);
+    const h2 = ((octets[2] << 8) | octets[3]).toString(16);
+    ip = `${ip.slice(0, lastColon + 1)}${h1}:${h2}`;
+  }
+
+  const dblSplit = ip.split('::');
+  if (dblSplit.length > 2) return null;
+
+  let groups;
+  if (dblSplit.length === 2) {
+    const left = dblSplit[0] ? dblSplit[0].split(':') : [];
+    const right = dblSplit[1] ? dblSplit[1].split(':') : [];
+    const missing = 8 - (left.length + right.length);
+    if (missing < 1) return null;
+    groups = [...left, ...Array(missing).fill('0'), ...right];
+  } else {
+    groups = ip.split(':');
+    if (groups.length !== 8) return null;
+  }
+
+  if (groups.length !== 8 || groups.some((g) => !/^[0-9a-f]{1,4}$/.test(g))) {
+    return null;
+  }
+  return groups.map((g) => g.padStart(4, '0'));
+}
+
 export function extractIpSubnet(rawIp) {
-  const ip = sanitizeStr(rawIp, 64);
+  let ip = sanitizeStr(rawIp, 64).toLowerCase();
   if (!ip) return '';
+
+  // Strip IPv4-mapped IPv6 prefix so ::ffff:1.2.3.4 normalizes identically to 1.2.3.4
+  if (ip.startsWith('::ffff:')) {
+    const maybeV4 = ip.slice(7);
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(maybeV4)) {
+      ip = maybeV4;
+    }
+  }
+
   // IPv4 -> /24 subnet
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
-    const parts = ip.split('.');
+    const parts = ip.split('.').map((x) => Number(x));
+    if (parts.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) return '';
     return `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
   }
-  // IPv6 -> /48 prefix
-  if (ip.includes(':')) {
-    const parts = ip.split(':').slice(0, 3);
-    return `${parts.join(':')}::/48`;
+
+  // IPv6 -> canonical expanded /48 prefix
+  const expanded = expandIpv6(ip);
+  if (expanded) {
+    return `${expanded[0]}:${expanded[1]}:${expanded[2]}::/48`;
   }
+
   return '';
 }
 
@@ -416,15 +519,26 @@ function isDatacenterOrVpnAsn(asnOrg, proxyHint = false) {
   if (!lower) return { proxyVpnFlag: false, datacenterFlag: false };
   for (const kw of DATACENTER_ASN_KEYWORDS) {
     if (lower.includes(kw)) {
-      const isVpn = kw.includes('vpn') || kw.includes('tor') || kw.includes('mullvad') || kw.includes('proton') || kw.includes('warp');
+      const isVpn =
+        kw.includes('vpn') ||
+        kw.includes('tor') ||
+        kw.includes('mullvad') ||
+        kw.includes('proton') ||
+        kw.includes('warp');
       return { proxyVpnFlag: isVpn, datacenterFlag: !isVpn };
     }
   }
   return { proxyVpnFlag: false, datacenterFlag: false };
 }
 
-export async function normalizeAndHashSignals(rawSignals, clientNetwork, env) {
+/**
+ * Normalize and hash all device signals into component hashes.
+ * Unavailable signals remain empty ("") so missing capabilities NEVER produce
+ * false mismatches or false matches across devices.
+ */
+export async function normalizeAndHashSignals(rawSignals, clientNetwork, env, installAnchor = null) {
   const s = rawSignals && typeof rawSignals === 'object' ? rawSignals : {};
+  const tgNative = s.telegramNative && typeof s.telegramNative === 'object' ? s.telegramNative : {};
   const salt = await getFingerprintSalt(env);
 
   const normalized = {
@@ -447,53 +561,152 @@ export async function normalizeAndHashSignals(rawSignals, clientNetwork, env) {
     maxTouchPoints: sanitizeNum(s.maxTouchPoints, 0, 64),
     platform: sanitizeStr(s.platform, 64),
     telegramPlatform: sanitizeStr(s.telegramPlatform, 32),
+    telegramVersion: sanitizeStr(s.telegramVersion, 24),
     userAgentFamily: sanitizeStr(s.userAgentFamily, 120),
+    osVersion: sanitizeStr(s.osVersion, 32),
+    webviewVersion: sanitizeStr(s.webviewVersion, 32),
+    deviceModel: sanitizeStr(s.deviceModel, 64),
     webdriver: Boolean(s.webdriver),
     automationSignals: Array.isArray(s.automationSignals)
       ? s.automationSignals.slice(0, 10).map((x) => sanitizeStr(x, 40))
       : [],
-    hasCanvas: Boolean(s.canvasHash),
-    hasWebgl: Boolean(s.webglRenderer || s.webglParamsHash),
+    hasCanvas: Boolean(sanitizeStr(s.canvasHash, 80)),
+    hasWebgl: Boolean(sanitizeStr(s.webglRenderer, 140) || sanitizeStr(s.webglParamsHash, 80)),
+    hasAudio: Boolean(sanitizeStr(s.audioHash, 80)),
+    biometricSupported: Boolean(tgNative.biometricSupported),
+    biometricAvailable: Boolean(tgNative.biometricAvailable),
+    biometricAccessGranted: Boolean(tgNative.biometricAccessGranted),
+    biometricDeviceId: sanitizeStr(tgNative.biometricDeviceId, 128),
+    deviceStorageSupported: Boolean(tgNative.deviceStorageSupported),
+    accountContinuityId: sanitizeStr(tgNative.accountContinuityId, 128),
+    accountContinuityRestored: Boolean(tgNative.accountContinuityRestored),
   };
 
-  // Strict fingerprint: combines full browser + rendering + hardware characteristics
+  // Independently verify any server-signed installation tokens passed via Cloud Run bridge
+  const anchor = installAnchor && typeof installAnchor === 'object' ? installAnchor : {};
+  const verifiedTokenIds = new Set();
+  let installTokenTampered = Boolean(anchor.tamperedCookieToken || anchor.tamperedStorageToken);
+
+  const candidateTokens = [anchor.cookieToken, anchor.storageToken, anchor.canonicalToken];
+  for (const tok of candidateTokens) {
+    if (!tok || typeof tok !== 'string') continue;
+    const check = await verifySignedInstallToken(tok, env);
+    if (check.valid && check.tokenId) {
+      verifiedTokenIds.add(check.tokenId);
+    } else if (tok.trim()) {
+      installTokenTampered = true;
+    }
+  }
+
+  // Strict fingerprint v2: deterministic system-font Canvas + WebGL + quantized Audio + hardware/model
   const strictCanonical = [
-    'strict:v1',
-    normalized.canvasHash,
-    normalized.webglVendor,
-    normalized.webglRenderer,
-    normalized.webglParamsHash,
-    normalized.audioHash,
-    normalized.fontMetricsHash,
+    'strict:v2',
+    normalized.canvasHash || 'missing:canvas',
+    normalized.webglVendor || 'missing:glv',
+    normalized.webglRenderer || 'missing:glr',
+    normalized.webglParamsHash || 'missing:glp',
+    normalized.audioHash || 'missing:audio',
+    normalized.fontMetricsHash || 'missing:font',
     `${normalized.screenWidth}x${normalized.screenHeight}@${normalized.devicePixelRatio}:${normalized.colorDepth}`,
     `${normalized.timezone}:${normalized.timezoneOffset}`,
     `${normalized.hardwareConcurrency}:${normalized.deviceMemory}:${normalized.maxTouchPoints}`,
     normalized.platform,
     normalized.telegramPlatform,
+    normalized.deviceModel,
+    normalized.osVersion,
   ].join('|');
 
-  // Fuzzy fingerprint: stable hardware/GPU/screen/timezone core (tolerates minor WebView updates)
-  const fuzzyCanonical = [
-    'fuzzy:v1',
-    normalized.webglRenderer || normalized.webglVendor,
-    `${normalized.screenWidth}x${normalized.screenHeight}@${normalized.devicePixelRatio}`,
-    `${normalized.hardwareConcurrency}:${normalized.deviceMemory}:${normalized.maxTouchPoints}`,
-    normalized.timezone,
-    normalized.platform,
-  ].join('|');
+  // Render Core: Canvas + WebGL + screen/DPR + platform (immune to Audio timeouts & font scaling)
+  // Only generated if Canvas OR WebGL is genuinely available (missing signals never match each other!)
+  const hasRenderCore = normalized.hasCanvas || normalized.hasWebgl;
+  const renderCoreCanonical = hasRenderCore
+    ? [
+        'render:v1',
+        normalized.canvasHash || 'missing:canvas',
+        normalized.webglVendor || 'missing:glv',
+        normalized.webglRenderer || 'missing:glr',
+        normalized.webglParamsHash || 'missing:glp',
+        `${normalized.screenWidth}x${normalized.screenHeight}@${normalized.devicePixelRatio}`,
+        normalized.platform,
+      ].join('|')
+    : '';
+
+  // Hardware Core (also stored as legacy fuzzyFpHash): GPU + screen + cores/mem/touch + model + tz
+  const hasHardwareCore = Boolean(
+    normalized.webglRenderer ||
+      normalized.webglVendor ||
+      (normalized.screenWidth > 0 && normalized.screenHeight > 0) ||
+      normalized.deviceModel
+  );
+  const hardwareCoreCanonical = hasHardwareCore
+    ? [
+        'hardware:v1',
+        normalized.webglRenderer || normalized.webglVendor,
+        `${normalized.screenWidth}x${normalized.screenHeight}@${normalized.devicePixelRatio}`,
+        `${normalized.hardwareConcurrency}:${normalized.deviceMemory}:${normalized.maxTouchPoints}`,
+        normalized.deviceModel,
+        normalized.timezone,
+        normalized.platform,
+      ].join('|')
+    : '';
 
   const clientIp = sanitizeStr(clientNetwork?.ip, 64);
   const subnet = extractIpSubnet(clientIp);
 
-  const [strictFpHash, fuzzyFpHash, ipHash, ipSubnetHash] = await Promise.all([
+  const installTokenHashes = await Promise.all(
+    Array.from(verifiedTokenIds).map((id) => sha256Hex(`${salt}|install_token|${id}`))
+  );
+
+  const [
+    strictFpHash,
+    renderCoreHash,
+    hardwareCoreHash,
+    tgBiometricIdHash,
+    accountStorageIdHash,
+    ipHash,
+    ipSubnetHash,
+  ] = await Promise.all([
     sha256Hex(`${salt}|${strictCanonical}`),
-    sha256Hex(`${salt}|${fuzzyCanonical}`),
+    renderCoreCanonical ? sha256Hex(`${salt}|${renderCoreCanonical}`) : Promise.resolve(''),
+    hardwareCoreCanonical ? sha256Hex(`${salt}|${hardwareCoreCanonical}`) : Promise.resolve(''),
+    normalized.biometricDeviceId.length >= 6
+      ? sha256Hex(`${salt}|tg_bio|${normalized.biometricDeviceId}`)
+      : Promise.resolve(''),
+    normalized.accountContinuityId.length >= 16
+      ? sha256Hex(`${salt}|acct_store|${normalized.accountContinuityId}`)
+      : Promise.resolve(''),
     clientIp ? sha256Hex(`${salt}|ip|${clientIp}`) : Promise.resolve(''),
     subnet ? sha256Hex(`${salt}|subnet|${subnet}`) : Promise.resolve(''),
   ]);
 
-  // Privacy-conscious signal summary (only hashes & non-PII technical dimensions)
+  // Backward-compatible legacy fuzzyFpHash falls back to hardwareCoreHash (or strictFpHash if hardware absent)
+  const fuzzyFpHash = hardwareCoreHash || strictFpHash;
+
+  const signalLinks = [];
+  for (const h of installTokenHashes) {
+    signalLinks.push({ signalType: 'install_token', signalHash: h });
+  }
+  // Only index strict_fp / render_core / hardware_core when actual device signals exist
+  if (hasRenderCore || hasHardwareCore) {
+    signalLinks.push({ signalType: 'strict_fp', signalHash: strictFpHash });
+  }
+  if (renderCoreHash) {
+    signalLinks.push({ signalType: 'render_core', signalHash: renderCoreHash });
+  }
+  if (hardwareCoreHash) {
+    signalLinks.push({ signalType: 'hardware_core', signalHash: hardwareCoreHash });
+  }
+  if (tgBiometricIdHash) {
+    signalLinks.push({ signalType: 'tg_biometric_id', signalHash: tgBiometricIdHash });
+  }
+  if (accountStorageIdHash) {
+    signalLinks.push({ signalType: 'account_storage_id', signalHash: accountStorageIdHash });
+  }
+
   const signalHashes = {
+    installTokens: installTokenHashes.map((h) => h.slice(0, 16)),
+    renderCore: renderCoreHash ? renderCoreHash.slice(0, 16) : '',
+    hardwareCore: hardwareCoreHash ? hardwareCoreHash.slice(0, 16) : '',
     canvas: normalized.canvasHash ? normalized.canvasHash.slice(0, 16) : '',
     webgl: normalized.webglParamsHash ? normalized.webglParamsHash.slice(0, 16) : '',
     audio: normalized.audioHash ? normalized.audioHash.slice(0, 16) : '',
@@ -501,14 +714,27 @@ export async function normalizeAndHashSignals(rawSignals, clientNetwork, env) {
     screen: `${normalized.screenWidth}x${normalized.screenHeight}@${normalized.devicePixelRatio}`,
     tz: normalized.timezone,
     tgPlatform: normalized.telegramPlatform,
+    tgVersion: normalized.telegramVersion,
+    model: normalized.deviceModel,
+    os: normalized.osVersion,
+    webview: normalized.webviewVersion,
     cores: normalized.hardwareConcurrency,
     touch: normalized.maxTouchPoints,
+    hasBioId: Boolean(tgBiometricIdHash),
+    hasAcctStorage: Boolean(accountStorageIdHash),
   };
 
   return {
     normalized,
+    installTokenHashes,
+    installTokenTampered,
     strictFpHash,
+    renderCoreHash,
+    hardwareCoreHash,
     fuzzyFpHash,
+    tgBiometricIdHash,
+    accountStorageIdHash,
+    signalLinks,
     ipHash,
     ipSubnetHash,
     signalHashes,
@@ -516,12 +742,43 @@ export async function normalizeAndHashSignals(rawSignals, clientNetwork, env) {
 }
 
 // ----------------------------------------------------------------------------
-// 5. Balanced Risk Scoring Engine (Shared IP Alone NEVER Auto-Rejects)
+// 5. Cross-Account Device Reputation & Risk Scoring Engine
 // ----------------------------------------------------------------------------
+
+function mergeUniqueMatches(...lists) {
+  const byUser = new Map();
+  for (const list of lists) {
+    for (const item of list || []) {
+      const uid = String(item?.userId || '');
+      if (!uid) continue;
+      const existing = byUser.get(uid);
+      if (!existing || (item.lastSeenAt || 0) > (existing.lastSeenAt || 0)) {
+        byUser.set(uid, item);
+      }
+    }
+  }
+  return Array.from(byUser.values());
+}
 
 export async function evaluateDeviceRisk(
   env,
-  { userId, normalized, strictFpHash, fuzzyFpHash, ipHash, ipSubnetHash, clientNetwork, now = Date.now() }
+  {
+    userId,
+    pendingReferrerId = null,
+    normalized,
+    installTokenHashes = [],
+    installTokenTampered = false,
+    strictFpHash,
+    renderCoreHash = '',
+    hardwareCoreHash = '',
+    fuzzyFpHash,
+    tgBiometricIdHash = '',
+    accountStorageIdHash = '',
+    ipHash,
+    ipSubnetHash,
+    clientNetwork,
+    now = Date.now(),
+  }
 ) {
   const reasons = [];
   let score = 0;
@@ -529,18 +786,58 @@ export async function evaluateDeviceRisk(
   const tenMinAgo = now - 10 * 60 * 1000;
   const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
 
-  const [strictMatches, fuzzyMatches, subnetMatches, recentIpAccounts, existingReview] =
-    await Promise.all([
-      findOtherUsersByFingerprint(env, 'strict', strictFpHash, userId),
-      findOtherUsersByFingerprint(env, 'fuzzy', fuzzyFpHash, userId),
-      findOtherUsersByIpSubnet(env, ipSubnetHash, userId, sevenDaysAgo),
-      countRecentDistinctUsersByIp(env, ipHash, tenMinAgo, userId),
-      getUserReferralReview(env, userId),
-    ]);
+  const installTokenQueries = (installTokenHashes || []).map((h) =>
+    findOtherUsersBySignal(env, 'install_token', h, userId)
+  );
+
+  const [
+    installTokenMatchLists,
+    strictSignalMatches,
+    legacyStrictMatches,
+    renderCoreMatches,
+    hardwareSignalMatches,
+    legacyFuzzyMatches,
+    biometricIdMatches,
+    subnetMatches,
+    recentIpAccounts,
+    existingReview,
+    ownSignalHistory,
+  ] = await Promise.all([
+    Promise.all(installTokenQueries),
+    strictFpHash && (normalized.hasCanvas || normalized.hasWebgl || hardwareCoreHash)
+      ? findOtherUsersBySignal(env, 'strict_fp', strictFpHash, userId)
+      : Promise.resolve([]),
+    strictFpHash && (normalized.hasCanvas || normalized.hasWebgl || hardwareCoreHash)
+      ? findOtherUsersByFingerprint(env, 'strict', strictFpHash, userId)
+      : Promise.resolve([]),
+    renderCoreHash
+      ? findOtherUsersBySignal(env, 'render_core', renderCoreHash, userId)
+      : Promise.resolve([]),
+    hardwareCoreHash
+      ? findOtherUsersBySignal(env, 'hardware_core', hardwareCoreHash, userId)
+      : Promise.resolve([]),
+    fuzzyFpHash && hardwareCoreHash
+      ? findOtherUsersByFingerprint(env, 'fuzzy', fuzzyFpHash, userId)
+      : Promise.resolve([]),
+    tgBiometricIdHash
+      ? findOtherUsersBySignal(env, 'tg_biometric_id', tgBiometricIdHash, userId)
+      : Promise.resolve([]),
+    findOtherUsersByIpSubnet(env, ipSubnetHash, userId, sevenDaysAgo),
+    countRecentDistinctUsersByIp(env, ipHash, tenMinAgo, userId),
+    getUserReferralReview(env, userId),
+    getUserDeviceSignalSummary(env, userId),
+  ]);
+
+  const installTokenMatches = mergeUniqueMatches(...installTokenMatchLists);
+  const strictMatches = mergeUniqueMatches(strictSignalMatches, legacyStrictMatches);
+  const hardwareMatches = mergeUniqueMatches(hardwareSignalMatches, legacyFuzzyMatches);
 
   const matchedUserSet = new Set();
+  const matchedSignalTypes = new Set();
+  const matchedSignalsDetail = {};
+  let hasStrongDeviceMatch = false;
 
-  // Preserve prior duplicate-device hold so a caught multi-account user cannot self-clear via incognito retry
+  // Preserve open duplicate-device hold so a caught user cannot self-clear by reinstalling or retrying
   if (
     existingReview &&
     existingReview.status === 'pending' &&
@@ -548,6 +845,7 @@ export async function evaluateDeviceRisk(
     existingReview.matchedUserIds.length > 0
   ) {
     score += 50;
+    hasStrongDeviceMatch = true;
     for (const prevId of existingReview.matchedUserIds) matchedUserSet.add(String(prevId));
     reasons.push({
       code: 'PRIOR_DUPLICATE_DEVICE_HOLD',
@@ -556,72 +854,146 @@ export async function evaluateDeviceRisk(
     });
   }
 
-  // 1. Strict device fingerprint match across multiple Telegram accounts (+70 -> pending_review)
+  // --- DEVICE IDENTITY SIGNALS (Independent of IP / VPN) ---
+
+  // 1. Server-signed WebView Installation Token shared across accounts (+75)
+  if (installTokenMatches.length > 0) {
+    score += 75;
+    hasStrongDeviceMatch = true;
+    matchedSignalTypes.add('install_token');
+    matchedSignalsDetail.install_token = installTokenMatches.map((m) => m.userId);
+    for (const m of installTokenMatches) matchedUserSet.add(m.userId);
+    reasons.push({
+      code: 'DUPLICATE_INSTALL_TOKEN',
+      weight: 75,
+      detail: `Shared server-signed Telegram WebView installation token with ${installTokenMatches.length} other account(s)`,
+    });
+  }
+
+  // 2. Strict full fingerprint match across accounts (+65 if primary, +15 corroboration if install_token already matched)
   if (strictMatches.length > 0) {
-    score += 70;
+    const w = installTokenMatches.length > 0 ? 15 : 65;
+    score += w;
+    hasStrongDeviceMatch = true;
+    matchedSignalTypes.add('strict_fp');
+    matchedSignalsDetail.strict_fp = strictMatches.map((m) => m.userId);
     for (const m of strictMatches) matchedUserSet.add(m.userId);
     reasons.push({
       code: 'DUPLICATE_STRICT_DEVICE',
-      weight: 70,
-      detail: `Matches ${strictMatches.length} other Telegram account(s) on strict browser/device fingerprint`,
+      weight: w,
+      detail: `Matches ${strictMatches.length} other Telegram account(s) on full deterministic device fingerprint`,
     });
-  } else if (fuzzyMatches.length > 0) {
-    // 2. Fuzzy match: high risk ONLY if combined with same IP subnet; otherwise informational (+20)
+  } else if (renderCoreMatches.length > 0) {
+    // 3. Render Core (Canvas + WebGL + screen/DPR) match — immune to Audio timeout / font drift!
+    const w = installTokenMatches.length > 0 ? 10 : 55;
+    score += w;
+    hasStrongDeviceMatch = true;
+    matchedSignalTypes.add('render_core');
+    matchedSignalsDetail.render_core = renderCoreMatches.map((m) => m.userId);
+    for (const m of renderCoreMatches) matchedUserSet.add(m.userId);
+    reasons.push({
+      code: 'DUPLICATE_RENDER_CORE',
+      weight: w,
+      detail: `Matches ${renderCoreMatches.length} other account(s) on Canvas/WebGL rendering core (independent of IP/Audio drift)`,
+    });
+  } else if (hardwareMatches.length > 0) {
+    // 4. Hardware Core fallback (GPU + screen + cores + model + timezone)
     const subnetSet = new Set(subnetMatches);
-    const fuzzyOnSameSubnet = fuzzyMatches.filter((m) => subnetSet.has(m.userId));
-    if (fuzzyOnSameSubnet.length > 0) {
-      score += 55;
-      for (const m of fuzzyOnSameSubnet) matchedUserSet.add(m.userId);
+    const hardwareOnSameSubnet = hardwareMatches.filter((m) => subnetSet.has(m.userId));
+    if (hardwareOnSameSubnet.length > 0 && installTokenMatches.length === 0) {
+      score += 40;
+      matchedSignalTypes.add('hardware_core');
+      matchedSignalsDetail.hardware_core = hardwareOnSameSubnet.map((m) => m.userId);
+      for (const m of hardwareOnSameSubnet) matchedUserSet.add(m.userId);
       reasons.push({
-        code: 'DUPLICATE_FUZZY_DEVICE_SAME_SUBNET',
-        weight: 55,
-        detail: `Hardware/WebView profile matches ${fuzzyOnSameSubnet.length} account(s) on the same network subnet`,
+        code: 'DUPLICATE_HARDWARE_SAME_SUBNET',
+        weight: 40,
+        detail: `Hardware/screen profile matches ${hardwareOnSameSubnet.length} account(s) on the same network subnet`,
       });
-    } else {
-      score += 20;
+    } else if (installTokenMatches.length === 0) {
+      // Common phone model on a different network -> informational only (+10)
+      score += 10;
       reasons.push({
-        code: 'SIMILAR_DEVICE_MODEL',
-        weight: 20,
-        detail: 'Similar hardware/screen profile seen on another network (common device model — informational only)',
+        code: 'SIMILAR_HARDWARE_MODEL',
+        weight: 10,
+        detail: 'Similar hardware/screen model seen on another network (informational only)',
       });
     }
   }
 
-  // 3. Shared IP / subnet ALONE contributes only +15 (NEVER auto-rejects families/hostels/Wi-Fi)
-  if (subnetMatches.length > 0 && strictMatches.length === 0) {
+  // 5. Optional Telegram BiometricManager.deviceId match (only when non-empty; missing NEVER penalized)
+  if (biometricIdMatches.length > 0) {
+    const w = hasStrongDeviceMatch ? 15 : 50;
+    score += w;
+    hasStrongDeviceMatch = true;
+    matchedSignalTypes.add('tg_biometric_id');
+    matchedSignalsDetail.tg_biometric_id = biometricIdMatches.map((m) => m.userId);
+    for (const m of biometricIdMatches) matchedUserSet.add(m.userId);
+    reasons.push({
+      code: 'DUPLICATE_TG_BIOMETRIC_ID',
+      weight: w,
+      detail: `Optional Telegram BiometricManager deviceId matched ${biometricIdMatches.length} other account(s)`,
+    });
+  }
+
+  // 6. Client tampered with installation token (+15 anomaly; forged token was NEVER trusted)
+  if (installTokenTampered) {
+    score += 15;
+    reasons.push({
+      code: 'INSTALL_TOKEN_TAMPERED',
+      weight: 15,
+      detail: 'Client presented an unsigned or tampered installation token (rejected by server)',
+    });
+  }
+
+  // 7. High-Priority Same-Device Self-Referral Check (+25)
+  const cleanReferrerId = pendingReferrerId ? String(pendingReferrerId).trim() : '';
+  const selfReferralDeviceMatch = Boolean(cleanReferrerId && matchedUserSet.has(cleanReferrerId));
+  if (selfReferralDeviceMatch) {
+    score += 25;
+    reasons.push({
+      code: 'SAME_DEVICE_SELF_REFERRAL',
+      weight: 25,
+      detail: `Referrer account (${cleanReferrerId}) shares device signals with this referred account`,
+    });
+  }
+
+  // --- SECONDARY NETWORK / IP SIGNALS (Shared Wi-Fi alone NEVER rejects!) ---
+
+  if (subnetMatches.length > 0 && !hasStrongDeviceMatch) {
     score += 15;
     reasons.push({
       code: 'SHARED_NETWORK_SUBNET',
       weight: 15,
-      detail: `Shared network with ${subnetMatches.length} other account(s) (partial signal only — does not auto-reject)`,
+      detail: `Shared network subnet with ${subnetMatches.length} other account(s) (secondary signal — does not auto-reject)`,
     });
   }
 
-  // 4. Rapid multi-account burst velocity from exact same IP within 10 minutes (+20)
-  if (recentIpAccounts >= 2) {
-    score += 20;
+  if (recentIpAccounts >= 2 && !hasStrongDeviceMatch) {
+    score += 15;
     reasons.push({
       code: 'HIGH_IP_VELOCITY',
-      weight: 20,
+      weight: 15,
       detail: `${recentIpAccounts} other account(s) verified from this IP in the last 10 minutes`,
     });
   }
 
-  // 5. VPN / Proxy / Datacenter ASN heuristic (+25 partial signal only)
+  // VPN / Datacenter ASN heuristic — ONLY applied when genuine client ASN/proxyHint is provided
   const asnOrg = sanitizeStr(clientNetwork?.asnOrg, 160);
   const netFlags = isDatacenterOrVpnAsn(asnOrg, Boolean(clientNetwork?.proxyHint));
   if (netFlags.proxyVpnFlag || netFlags.datacenterFlag) {
-    score += 25;
+    score += 20;
     reasons.push({
       code: netFlags.proxyVpnFlag ? 'VPN_OR_PROXY_DETECTED' : 'DATACENTER_ASN_DETECTED',
-      weight: 25,
+      weight: 20,
       detail: asnOrg
-        ? `Network provider flagged as VPN/datacenter (${asnOrg})`
+        ? `Client network flagged as VPN/datacenter (${asnOrg})`
         : 'Proxy or VPN network header detected',
     });
   }
 
-  // 6. Browser automation / tampering anomalies (+40)
+  // --- AUTOMATION & CAPABILITY SIGNALS ---
+
   const automationDetected =
     normalized.webdriver ||
     (Array.isArray(normalized.automationSignals) && normalized.automationSignals.length > 0);
@@ -634,17 +1006,44 @@ export async function evaluateDeviceRisk(
     });
   }
 
-  // 7. Missing basic rendering signals (possible stripped headless environment) (+15)
+  // Missing both Canvas and WebGL -> minor partial signal (+10), NEVER rejects unsupported clients alone!
   if (!normalized.hasCanvas && !normalized.hasWebgl) {
-    score += 15;
+    score += 10;
     reasons.push({
       code: 'MISSING_RENDER_SIGNALS',
-      weight: 15,
-      detail: 'Canvas and WebGL rendering characteristics unavailable',
+      weight: 10,
+      detail: 'Canvas and WebGL rendering unavailable on this client (informational partial signal)',
+    });
+  }
+
+  // --- INFORMATIONAL SAME-ACCOUNT CONTINUITY SIGNALS (weight = 0, NEVER reject) ---
+  if (
+    renderCoreHash &&
+    ownSignalHistory.renderCores.size > 0 &&
+    !ownSignalHistory.renderCores.has(renderCoreHash)
+  ) {
+    reasons.push({
+      code: 'SAME_ACCOUNT_NEW_DEVICE',
+      weight: 0,
+      detail: 'This Telegram account was previously observed on a different device rendering profile',
+    });
+  }
+
+  if (
+    accountStorageIdHash &&
+    ownSignalHistory.accountStorageIds.size > 0 &&
+    !ownSignalHistory.accountStorageIds.has(accountStorageIdHash)
+  ) {
+    reasons.push({
+      code: 'STORAGE_CONTINUITY_RESET',
+      weight: 0,
+      detail: 'Per-account Telegram DeviceStorage continuity ID changed (reinstall or second device)',
     });
   }
 
   const finalScore = Math.max(0, Math.min(100, score));
+
+  // Separate Account Access Verdict vs Referral Reward Decision
   let verdict = DEVICE_VERIFICATION_STATUS.VERIFIED;
   if (finalScore >= DEVICE_RISK_THRESHOLDS.REJECTED) {
     verdict = DEVICE_VERIFICATION_STATUS.REJECTED;
@@ -652,11 +1051,28 @@ export async function evaluateDeviceRisk(
     verdict = DEVICE_VERIFICATION_STATUS.PENDING_REVIEW;
   }
 
+  let referralDecision = 'no_referrer';
+  let holdReferralReview = false;
+  if (cleanReferrerId) {
+    if (verdict !== DEVICE_VERIFICATION_STATUS.VERIFIED || hasStrongDeviceMatch || selfReferralDeviceMatch) {
+      referralDecision = 'held_for_review';
+      holdReferralReview = true;
+    } else {
+      referralDecision = 'eligible';
+    }
+  }
+
   return {
     riskScore: finalScore,
     verdict,
+    referralDecision,
+    holdReferralReview,
+    selfReferralDeviceMatch,
+    hasStrongDeviceMatch,
     reasons,
     matchedUserIds: Array.from(matchedUserSet),
+    matchedSignalTypes: Array.from(matchedSignalTypes),
+    matchedSignalsDetail,
     proxyVpnFlag: netFlags.proxyVpnFlag,
     datacenterFlag: netFlags.datacenterFlag,
   };
@@ -676,15 +1092,21 @@ function workerJson(body, status = 200) {
   });
 }
 
+/**
+ * Extract genuine client network metadata forwarded by Cloud Run (`server.ts`).
+ * IMPORTANT: Never falls back to `request.cf.asn`, `request.cf.asOrganization`,
+ * or `request.cf.country`, because those describe the Cloud Run egress proxy,
+ * NOT the user's Android device!
+ */
 function extractClientNetwork(bodyNetwork, request) {
   const net = bodyNetwork && typeof bodyNetwork === 'object' ? bodyNetwork : {};
-  const cf = request?.cf && typeof request.cf === 'object' ? request.cf : {};
   return {
-    ip: sanitizeStr(net.ip || request.headers.get('CF-Connecting-IP') || '', 64),
-    countryCode: sanitizeStr(net.countryCode || cf.country || '', 16),
-    asn: sanitizeStr(net.asn || (cf.asn ? String(cf.asn) : ''), 32),
-    asnOrg: sanitizeStr(net.asnOrg || cf.asOrganization || '', 160),
+    ip: sanitizeStr(net.ip || '', 64),
+    countryCode: sanitizeStr(net.countryCode || '', 16),
+    asn: sanitizeStr(net.asn || '', 32),
+    asnOrg: sanitizeStr(net.asnOrg || '', 160),
     proxyHint: Boolean(net.proxyHint),
+    bridgeCallerIp: sanitizeStr(request?.headers?.get('CF-Connecting-IP') || '', 64),
   };
 }
 
@@ -828,11 +1250,105 @@ export async function handleDeviceVerifySession(request, env) {
 }
 
 /**
+ * POST /api/internal/device-verify/observe
+ * Observation-only endpoint for grandfathered, already-verified, and admin accounts.
+ * Indexes their server-signed installation token & device signals in D1 so secondary
+ * accounts opened on the same physical phone are detected, WITHOUT EVER altering
+ * their verification status, balances, referrals, or blocking access.
+ */
+export async function handleDeviceVerifyObserve(request, env) {
+  const rawBody = await request.text();
+  const auth = await verifyBridgeSignature(request, rawBody, env);
+  if (!auth.ok) {
+    return workerJson({ ok: false, error: auth.error }, auth.status || 401);
+  }
+
+  let body;
+  try {
+    body = JSON.parse(rawBody || '{}');
+  } catch {
+    return workerJson({ ok: false, error: 'Invalid JSON body.' }, 400);
+  }
+
+  const initCheck = await verifyTelegramInitData(body.initData, env?.BOT_TOKEN);
+  if (!initCheck.ok) {
+    return workerJson(
+      { ok: false, expired: Boolean(initCheck.expired), error: initCheck.error },
+      401
+    );
+  }
+
+  const tgUser = initCheck.user;
+  const userId = tgUser.id;
+  const { user } = await createOrUpdateUserFromTelegram(env, tgUser);
+  const adminUser = await isAdmin(userId, env);
+
+  const isEligibleForObserve =
+    adminUser ||
+    user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.GRANDFATHERED ||
+    user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.VERIFIED;
+
+  if (!isEligibleForObserve) {
+    return workerJson({
+      ok: true,
+      observed: false,
+      status: user.deviceVerificationStatus,
+    });
+  }
+
+  const clientNetwork = extractClientNetwork(body.clientNetwork, request);
+  const fpData = await normalizeAndHashSignals(
+    body.signals,
+    clientNetwork,
+    env,
+    body.installAnchor
+  );
+  const ownHistory = await getUserDeviceSignalSummary(env, userId);
+  const switchedDevice = Boolean(
+    fpData.renderCoreHash &&
+      ownHistory.renderCores.size > 0 &&
+      !ownHistory.renderCores.has(fpData.renderCoreHash)
+  );
+  const storageReset = Boolean(
+    fpData.accountStorageIdHash &&
+      ownHistory.accountStorageIds.size > 0 &&
+      !ownHistory.accountStorageIds.has(fpData.accountStorageIdHash)
+  );
+
+  const now = Date.now();
+  await recordDeviceObservationAtomic(env, {
+    userId,
+    strictFpHash: fpData.strictFpHash,
+    fuzzyFpHash: fpData.fuzzyFpHash,
+    signalLinks: fpData.signalLinks,
+    ipHash: fpData.ipHash,
+    countryCode: clientNetwork.countryCode,
+    observedStatus: adminUser ? 'admin_observed' : user.deviceVerificationStatus,
+    details: {
+      isAdmin: adminUser,
+      switchedDevice,
+      storageReset,
+      installTokenCount: fpData.installTokenHashes.length,
+    },
+    now,
+  });
+
+  return workerJson({
+    ok: true,
+    observed: true,
+    status: user.deviceVerificationStatus,
+    accountDecision: adminUser ? 'admin_bypass' : 'preserved_access',
+    switchedDevice,
+    storageReset,
+  });
+}
+
+/**
  * POST /api/internal/device-verify/submit
  * Validates Telegram `initData`, consumes single-use challenge nonce, computes
- * probabilistic fingerprints, evaluates risk, persists atomically in D1, issues
- * signed server-side verification token, and on clean pass unlocks the bot menu
- * and runs pending referral crediting.
+ * component device hashes, evaluates cross-account reputation risk, persists
+ * atomically in D1, issues signed server-side verification token, and on clean
+ * pass unlocks the bot menu and runs eligible referral crediting.
  */
 export async function handleDeviceVerifySubmit(request, env) {
   const rawBody = await request.text();
@@ -888,11 +1404,25 @@ export async function handleDeviceVerifySubmit(request, env) {
     );
   }
 
-  // Short-circuit if user is already verified or grandfathered
+  // Short-circuit if user is already verified or grandfathered (still record observation silently!)
   if (
     user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.VERIFIED ||
     user.deviceVerificationStatus === DEVICE_VERIFICATION_STATUS.GRANDFATHERED
   ) {
+    if (body.signals && typeof body.signals === 'object') {
+      const obsNet = extractClientNetwork(body.clientNetwork, request);
+      const obsFp = await normalizeAndHashSignals(body.signals, obsNet, env, body.installAnchor);
+      await recordDeviceObservationAtomic(env, {
+        userId,
+        strictFpHash: obsFp.strictFpHash,
+        fuzzyFpHash: obsFp.fuzzyFpHash,
+        signalLinks: obsFp.signalLinks,
+        ipHash: obsFp.ipHash,
+        countryCode: obsNet.countryCode,
+        observedStatus: user.deviceVerificationStatus,
+        details: { viaSubmitShortCircuit: true },
+      });
+    }
     const token = await signVerificationToken(env, {
       jti: generateId('VTKN'),
       uid: userId,
@@ -902,6 +1432,7 @@ export async function handleDeviceVerifySubmit(request, env) {
       ok: true,
       alreadyVerified: true,
       verdict: user.deviceVerificationStatus,
+      referralDecision: 'preserved',
       verificationToken: token,
       message: 'Your device is already verified.',
     });
@@ -968,13 +1499,25 @@ export async function handleDeviceVerifySubmit(request, env) {
   }
 
   const clientNetwork = extractClientNetwork(body.clientNetwork, request);
-  const fpData = await normalizeAndHashSignals(body.signals, clientNetwork, env);
+  const fpData = await normalizeAndHashSignals(
+    body.signals,
+    clientNetwork,
+    env,
+    body.installAnchor
+  );
 
   const risk = await evaluateDeviceRisk(env, {
     userId,
+    pendingReferrerId: user.pendingReferrerId || null,
     normalized: fpData.normalized,
+    installTokenHashes: fpData.installTokenHashes,
+    installTokenTampered: fpData.installTokenTampered,
     strictFpHash: fpData.strictFpHash,
+    renderCoreHash: fpData.renderCoreHash,
+    hardwareCoreHash: fpData.hardwareCoreHash,
     fuzzyFpHash: fpData.fuzzyFpHash,
+    tgBiometricIdHash: fpData.tgBiometricIdHash,
+    accountStorageIdHash: fpData.accountStorageIdHash,
     ipHash: fpData.ipHash,
     ipSubnetHash: fpData.ipSubnetHash,
     clientNetwork,
@@ -991,6 +1534,7 @@ export async function handleDeviceVerifySubmit(request, env) {
     initDataHash: initCheck.initDataHash,
     strictFpHash: fpData.strictFpHash,
     fuzzyFpHash: fpData.fuzzyFpHash,
+    signalLinks: fpData.signalLinks,
     signalHashes: fpData.signalHashes,
     ipHash: fpData.ipHash,
     ipSubnetHash: fpData.ipSubnetHash,
@@ -1002,9 +1546,12 @@ export async function handleDeviceVerifySubmit(request, env) {
     riskScore: risk.riskScore,
     riskReasons: risk.reasons,
     verdict: risk.verdict,
+    referralDecision: risk.referralDecision,
+    holdReferralReview: risk.holdReferralReview,
     verifiedTokenJti: tokenJti,
     pendingReferrerId: user.pendingReferrerId || null,
     matchedUserIds: risk.matchedUserIds,
+    matchedSignalTypes: risk.matchedSignalTypes,
     now,
   });
 
@@ -1023,10 +1570,12 @@ export async function handleDeviceVerifySubmit(request, env) {
     score: risk.riskScore,
   });
 
-  // Clean VERIFIED verdict -> credit pending referral (if any) & unlock Telegram bot menu!
+  // Clean VERIFIED verdict -> unlock bot menu, and credit pending referral ONLY if referralDecision === 'eligible'
   if (risk.verdict === DEVICE_VERIFICATION_STATUS.VERIFIED) {
-    const referralResult = await processPendingReferral(env, userId);
-    const refreshedUser = (await getUser(env, userId)) || user;
+    let referralResult = { credited: false };
+    if (risk.referralDecision === 'eligible') {
+      referralResult = await processPendingReferral(env, userId);
+    }
 
     try {
       const unlockText =
@@ -1046,6 +1595,10 @@ export async function handleDeviceVerifySubmit(request, env) {
     return workerJson({
       ok: true,
       verdict: DEVICE_VERIFICATION_STATUS.VERIFIED,
+      referralDecision: referralResult?.credited ? 'credited' : risk.referralDecision,
+      riskScore: risk.riskScore,
+      matchedUserIds: risk.matchedUserIds,
+      matchedSignalTypes: risk.matchedSignalTypes,
       verificationId,
       verificationToken,
       referralCredited: Boolean(referralResult?.credited),
@@ -1094,6 +1647,10 @@ export async function handleDeviceVerifySubmit(request, env) {
   return workerJson({
     ok: true,
     verdict: risk.verdict,
+    referralDecision: risk.referralDecision,
+    riskScore: risk.riskScore,
+    matchedUserIds: risk.matchedUserIds,
+    matchedSignalTypes: risk.matchedSignalTypes,
     verificationId,
     reviewId: pendingReview?.id || saveRes.reviewId || null,
     verificationToken,

@@ -21,6 +21,7 @@
     "db:list:remote": "npx wrangler d1 migrations list pna-rewards-db --remote",
     "db:integrity:remote": "npx wrangler d1 execute pna-rewards-db --remote --file=scripts/d1-integrity-check.sql",
     "db:apply:0002:remote": "npx wrangler d1 execute pna-rewards-db --remote --file=migrations/0002_device_verification.sql",
+    "db:apply:0003:remote": "npx wrangler d1 execute pna-rewards-db --remote --file=migrations/0003_device_reputation_signals.sql",
     "clean": "rm -rf dist dist-miniapp"
   },
   "dependencies": {

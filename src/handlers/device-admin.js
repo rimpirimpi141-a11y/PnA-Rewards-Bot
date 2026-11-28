@@ -107,13 +107,21 @@ export async function handleAdminReferralReviewsList(env, adminId, chatId, page 
   } else {
     for (const r of pageData.items) {
       const reasonsText = (r.riskReasons || [])
-        .slice(0, 2)
+        .slice(0, 3)
         .map((x) => escapeHtml(x.code || String(x)))
         .join(', ');
+      const isSelfRefDevice = (r.matchedUserIds || []).includes(String(r.referrerId));
+      const matchedPreview = (r.matchedUserIds || []).length
+        ? r.matchedUserIds
+            .slice(0, 4)
+            .map((id) => `<code>${escapeHtml(id)}</code>`)
+            .join(', ')
+        : 'None';
       text +=
-        `🆔 <code>${escapeHtml(r.id)}</code> — Risk: <b>${r.riskScore}/100</b>\n` +
+        `🆔 <code>${escapeHtml(r.id)}</code> — Risk: <b>${r.riskScore}/100</b>${isSelfRefDevice ? ' 🚨 <b>SELF-REFERRAL DEVICE</b>' : ''}\n` +
         `👤 Referred: <code>${escapeHtml(r.referredUserId)}</code> ← Referrer: <code>${escapeHtml(r.referrerId)}</code>\n` +
-        `📱 Cluster Matches: <b>${(r.matchedUserIds || []).length}</b> | Flags: <i>${reasonsText || 'N/A'}</i>\n` +
+        `👥 Matched IDs: ${matchedPreview}\n` +
+        `🔎 Signals: <i>${reasonsText || 'N/A'}</i>\n` +
         `🕒 ${formatIST(r.createdAt, env)}\n\n`;
 
       rows.push([
@@ -170,14 +178,16 @@ export async function handleAdminReferralReviewDetail(env, callbackQuery, review
     ? review.matchedUserIds.map((id) => `<code>${escapeHtml(id)}</code>`).join(', ')
     : 'None';
 
+  const isSelfRefDevice = (review.matchedUserIds || []).includes(String(review.referrerId));
   const text =
     `${buildHeader('🔍', 'SUSPICIOUS REFERRAL REVIEW')}\n` +
     `🆔 <b>Review ID:</b> <code>${escapeHtml(review.id)}</code>\n` +
     `📌 <b>Status:</b> <b>${escapeHtml(review.status.toUpperCase())}</b>\n` +
-    `⚠️ <b>Risk Score:</b> <b>${review.riskScore}/100</b>\n` +
+    `⚠️ <b>Risk Score:</b> <b>${review.riskScore}/100</b>${isSelfRefDevice ? ' | 🚨 <b>SAME-DEVICE SELF-REFERRAL</b>' : ''}\n` +
     `${DIVIDER}\n` +
     `👤 <b>Referred User:</b> ${escapeHtml(formatUserName(referredUser))} (${escapeHtml(formatUsernameTag(referredUser?.username))}) [<code>${escapeHtml(review.referredUserId)}</code>]\n` +
     `👑 <b>Referrer:</b> ${escapeHtml(formatUserName(referrerUser))} (${escapeHtml(formatUsernameTag(referrerUser?.username))}) [<code>${escapeHtml(review.referrerId)}</code>]\n` +
+    `🔗 <b>Referral Relationship:</b> ${isSelfRefDevice ? '🚨 Referrer is in matched device cluster' : 'Referred user matched another account cluster'}\n` +
     `🧬 <b>Device Hash:</b> <code>${escapeHtml((review.clusterFpHash || '').slice(0, 16))}…</code>\n` +
     `👥 <b>Matched Accounts:</b> ${matchedIds}\n` +
     `${DIVIDER}\n` +
@@ -320,6 +330,13 @@ export async function handleAdminDeviceClustersList(env, adminId, chatId, page =
     `🔎 <b>Multi-Account Clusters:</b> <b>${pageData.total}</b> (Page ${pageData.page}/${pageData.totalPages})\n` +
     `${DIVIDER}\n`;
 
+  const SIGNAL_LABELS = {
+    install_token: '🔑 Install Token',
+    strict_fp: '🧬 Strict FP',
+    render_core: '🎨 Render Core',
+    tg_biometric_id: '🪪 Biometric ID',
+  };
+
   if (!pageData.items.length) {
     text += `✅ <i>No duplicate device clusters detected across multiple accounts.</i>`;
   } else {
@@ -329,10 +346,12 @@ export async function handleAdminDeviceClustersList(env, adminId, chatId, page =
         .slice(0, 8)
         .map((id) => `<code>${escapeHtml(id)}</code>`)
         .join(', ');
+      const sigLabel = SIGNAL_LABELS[c.signalType] || '🧬 Device Signal';
+      const refTag = c.hasReferralLink ? '🔗 Referral Linked' : 'ℹ️ Non-Referral Cluster';
       text +=
-        `${i + 1}. 🧬 <code>${escapeHtml(c.fingerprintHash.slice(0, 14))}…</code> — <b>${c.accountCount} accounts</b> (Max Risk: ${c.maxRiskScore}/100)\n` +
+        `${i + 1}. <b>${sigLabel}</b> <code>${escapeHtml(c.fingerprintHash.slice(0, 14))}…</code> — <b>${c.accountCount} accounts</b> (Max Risk: ${c.maxRiskScore}/100)\n` +
         `   👥 IDs: ${ids}${c.userIds.length > 8 ? ` +${c.userIds.length - 8} more` : ''}\n` +
-        `   🕒 Last seen: ${formatIST(c.lastSeenAt, env)}\n\n`;
+        `   📌 ${refTag} | 🕒 Last seen: ${formatIST(c.lastSeenAt, env)}\n\n`;
     }
   }
 
